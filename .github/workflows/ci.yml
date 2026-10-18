@@ -108,9 +108,12 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
+          # 只推自己的 ghcr 镜像。
+          #
+          # 曾经把上游的 fawenyo/miwifi-exporter 也列进来，但本 CI 没有 Docker Hub
+          # 凭据，推送必然 401 失败——而且覆盖原作者的镜像本来就不该做。
           images: |
             ${{ env.REGISTRY_IMAGE }}
-            fawenyo/miwifi-exporter
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
