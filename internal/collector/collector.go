@@ -263,15 +263,42 @@ func (c *Collector) emitWAN(ch chan<- prometheus.Metric, s *router.Snapshot) {
 	emit(ch, c.d.wanUploadTraffic, parseFloat(wan.Upload), host)
 	emit(ch, c.d.wanDownTraffic, parseFloat(wan.Download), host)
 
+	// WAN 地址按实体建模：每个地址一条序列，没有实体就没有序列。
+	//
+	// 部分固件在 WAN 未连接（或用了别的接入方式）时会返回一条 ip/mask
+	// 全为空的占位记录。照单全收就会导出 ipv4="" / ipv6="" 这种空标签序列——
+	// 它不但没有意义，还会稳定占住一条时间序列，被误读成「有一台地址为空的 WAN」。
 	for _, ipv4 := range s.WanInfo.Ipv4 {
+		if strings.TrimSpace(ipv4.IP) == "" {
+			continue
+		}
 		emit(ch, c.d.ipv4, 1, host, ipv4.IP)
+
+		// 掩码解析不出来时不发 ipv4_mask，而不是发 0。
+		//
+		// 0 在这里没有任何真实含义：net.IPv4Mask(...).Size() 解析失败时
+		// 返回的就是 0，发出去会被读成「/0 网段」，属于谎报。
+		// 缺掩码的代价只是少一条序列，比谎报一个 /0 便宜得多。
 		mask, err := subnetMaskToLen(ipv4.Mask)
 		if err != nil {
-			c.logger.Warn("解析子网掩码失败", "host", host, "mask", ipv4.Mask, "err", err.Error())
+			// 空 mask 是「路由器没上报」，与 wan_negotiation_speed 同类，
+			// 每轮 scrape 都会遇到，用 debug 免得刷屏；有内容却解析不了
+			// 才是真的固件异常，值得 warn。
+			if strings.TrimSpace(ipv4.Mask) == "" {
+				c.logger.Debug("路由器未上报 WAN IPv4 掩码，已跳过该掩码序列",
+					"host", host, "ip", ipv4.IP)
+			} else {
+				c.logger.Warn("WAN IPv4 掩码不可解析，已跳过该掩码序列",
+					"host", host, "ip", ipv4.IP, "mask", ipv4.Mask, "err", err.Error())
+			}
+			continue
 		}
 		emit(ch, c.d.ipv4Mask, float64(mask), host, ipv4.IP)
 	}
 	for _, ipv6 := range s.WanInfo.Ipv6Info.IP6Addr {
+		if strings.TrimSpace(ipv6) == "" {
+			continue
+		}
 		emit(ch, c.d.ipv6, 1, host, ipv6)
 	}
 
@@ -475,7 +502,14 @@ func subnetMaskToLen(netmask string) (int, error) {
 		}
 		bytes[i] = byte(n)
 	}
-	ones, _ := net.IPv4Mask(bytes[0], bytes[1], bytes[2], bytes[3]).Size()
+	mask := net.IPv4Mask(bytes[0], bytes[1], bytes[2], bytes[3])
+	ones, bits := mask.Size()
+	// Size() 对非连续掩码（如 255.0.255.0）返回 (0, 0)，**不报错**。
+	// 而 0 会被读成 /0 网段——那是个根本不存在的巨大网段，等于谎报。
+	// 反查一遍确认拿到的是规范化形式，非连续就当解析失败处理。
+	if bits != 32 || !net.IP(mask).Equal(net.IP(net.CIDRMask(ones, 32))) {
+		return 0, fmt.Errorf("netmask:%v 不是连续的 CIDR 掩码", netmask)
+	}
 	return ones, nil
 }
 

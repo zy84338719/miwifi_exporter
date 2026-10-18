@@ -523,3 +523,171 @@ func TestEndpointSupportedIsCorrectOnFirstGather(t *testing.T) {
 		}
 	}
 }
+
+// TestEmptyOrBrokenWANAddressIsNotExported 守住「没有实体就没有序列」这条规则。
+//
+// 部分固件在 WAN 未连接（或用了别的接入方式）时，wan_info 的 ipv4 数组里
+// 会带一条 ip/mask 全为空的占位记录；也有固件给了 IP 却不给 mask。
+// 旧实现照单全收，导出的是：
+//
+//	miwifi_ipv4{host="h",ipv4=""} 1              ← 空标签，无意义的序列
+//	miwifi_ipv4_mask{host="h",ipv4=""} 0          ← 0 会被读成 /0 网段
+//
+// 真机上这会让每轮采集都刷一条 WARN，且 Prometheus 里长期挂着
+// 一条地址为空的「WAN」，比缺一条序列更难排查。
+func TestEmptyOrBrokenWANAddressIsNotExported(t *testing.T) {
+	tests := []struct {
+		name string
+		// ipv4 是注入到 wan_info 的 ipv4 数组（原始 JSON）。
+		ipv4     string
+		wantIPv4 string // 期望存在的 ipv4 标签值；空表示不该有任何 ipv4 序列
+		wantMask string // 期望存在的 ipv4_mask 标签值；空表示不该有任何 mask 序列
+	}{
+		{
+			name:     "正常地址",
+			ipv4:     `[{"ip":"10.10.30.249","mask":"255.255.255.0"}]`,
+			wantIPv4: "10.10.30.249",
+			wantMask: "10.10.30.249",
+		},
+		{
+			name: "IP 与 mask 全空（WAN 未连接的占位记录）",
+			ipv4: `[{"ip":"","mask":""}]`,
+			// 整条实体跳过：既没有 ipv4，也没有 ipv4_mask
+		},
+		{
+			name: "只有空白字符",
+			ipv4: `[{"ip":"   ","mask":"  "}]`,
+		},
+		{
+			name: "有 IP 但没给 mask",
+			ipv4: `[{"ip":"10.10.30.249","mask":""}]`,
+			// IP 是有效实体的，照发；掩码无从得知，不能谎报成 0
+			wantIPv4: "10.10.30.249",
+		},
+		{
+			name:     "掩码不可解析",
+			ipv4:     `[{"ip":"10.10.30.249","mask":"255.255.255"}]`,
+			wantIPv4: "10.10.30.249",
+		},
+		{
+			name:     "掩码非连续",
+			ipv4:     `[{"ip":"10.10.30.249","mask":"255.0.255.0"}]`,
+			wantIPv4: "10.10.30.249",
+		},
+		{
+			name: "空地址与正常地址混在一起",
+			ipv4: `[{"ip":"","mask":""},{"ip":"10.10.30.249","mask":"255.255.255.0"}]`,
+			// 跳过空的那条，保留正常的那条
+			wantIPv4: "10.10.30.249",
+			wantMask: "10.10.30.249",
+		},
+		{
+			name:     "ipv4 数组为空",
+			ipv4:     `[]`,
+			wantIPv4: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := testutil.NewFakeRouter(t)
+			fake.SetPayload("api/xqnetwork/wan_info",
+				`{"code":0,"info":{"ipv4":`+tc.ipv4+`,"ipv6_info":{"ip6addr":["240e::1"]},"dnsAddrs":"1.1.1.1"}}`)
+
+			client, err := router.New(router.Options{
+				BaseURL:  fake.URL(),
+				Password: "test-password",
+				Timeout:  3 * time.Second,
+				Retry:    retry.Config{Attempts: 1},
+			})
+			if err != nil {
+				t.Fatalf("构造 router.Client 失败: %v", err)
+			}
+			t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+			got := gather(t, gatherRegistry(t, newCollector(t, client, "miwifi", "testhost")))
+
+			assertLabel := func(metric string, label string, want string) {
+				t.Helper()
+				series := got[metric]
+				if series == nil {
+					if want != "" {
+						t.Fatalf("%s 完全没导出，期望至少有一条 %s=%q", metric, label, want)
+					}
+					return
+				}
+				var values []string
+				for _, m := range series.GetMetric() {
+					for _, lp := range m.GetLabel() {
+						if lp.GetName() == label {
+							values = append(values, lp.GetValue())
+						}
+					}
+				}
+				for _, v := range values {
+					if v == "" {
+						t.Errorf("%s 导出了空标签序列 %s=\"\"，应当整条跳过", metric, label)
+					}
+				}
+				if want == "" {
+					if len(values) != 0 {
+						t.Errorf("%s 导出了 %v，期望一条都不导出", metric, values)
+					}
+					return
+				}
+				found := false
+				for _, v := range values {
+					if v == want {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("%s 的 %s 标签 = %v，期望包含 %q", metric, label, values, want)
+				}
+			}
+
+			assertLabel("miwifi_ipv4", "ipv4", tc.wantIPv4)
+			assertLabel("miwifi_ipv4_mask", "ipv4", tc.wantMask)
+
+			// ipv6 同理：空串不是合法地址
+			assertLabel("miwifi_ipv6", "ipv6", "240e::1")
+		})
+	}
+}
+
+// TestIPv6EmptyAddressIsSkipped 单独钉住 ipv6 的空值防护。
+func TestIPv6EmptyAddressIsSkipped(t *testing.T) {
+	fake := testutil.NewFakeRouter(t)
+	fake.SetPayload("api/xqnetwork/wan_info",
+		`{"code":0,"info":{"ipv4":[{"ip":"10.10.30.249","mask":"255.255.255.0"}],`+
+			`"ipv6_info":{"ip6addr":["","240e::1","  "]}}}`)
+
+	client, err := router.New(router.Options{
+		BaseURL:  fake.URL(),
+		Password: "test-password",
+		Timeout:  3 * time.Second,
+		Retry:    retry.Config{Attempts: 1},
+	})
+	if err != nil {
+		t.Fatalf("构造 router.Client 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	got := gather(t, gatherRegistry(t, newCollector(t, client, "miwifi", "testhost")))
+
+	series := got["miwifi_ipv6"]
+	if series == nil {
+		t.Fatal("miwifi_ipv6 完全没导出")
+	}
+	var values []string
+	for _, m := range series.GetMetric() {
+		for _, lp := range m.GetLabel() {
+			if lp.GetName() == "ipv6" {
+				values = append(values, lp.GetValue())
+			}
+		}
+	}
+	if len(values) != 1 || values[0] != "240e::1" {
+		t.Errorf("miwifi_ipv6 导出 = %v，期望恰好一条 240e::1（空串应被跳过）", values)
+	}
+}

@@ -26,7 +26,9 @@ func TestSubnetMaskToLen(t *testing.T) {
 		{name: "16 位", mask: "255.255.0.0", want: 16},
 		{name: "8 位", mask: "255.0.0.0", want: 8},
 		{name: "32 位", mask: "255.255.255.255", want: 32},
-		{name: "非连续掩码", mask: "255.0.255.0", want: 0},
+		// 非连续掩码必须报错而不是返回 0：Size() 会给 (0, false)，
+		// 忽略 ok 的话 0 会被当成 /0 网段发出去。
+		{name: "非连续掩码", mask: "255.0.255.0", wantErr: true},
 		{name: "段数不足", mask: "255.255.255", wantErr: true},
 		{name: "段数过多", mask: "255.255.255.255.0", wantErr: true},
 		{name: "非数字", mask: "255.255.255.a", wantErr: true},

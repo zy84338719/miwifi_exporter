@@ -38,12 +38,14 @@ build-linux: ## 交叉编译 linux/amd64
 
 .PHONY: build-all
 build-all: build-linux ## 构建 linux 各架构
-	@for arch in arm64 armv7; do \
-		echo "==> linux/$$arch"; \
-		CGO_ENABLED=0 GOOS=linux GOARCH=$$arch \
-			go build -trimpath -ldflags "$(LDFLAGS) -s -w" \
-			-o $(BIN_DIR)/$(PROJECT)-linux-$$arch $(MAIN_PATH); \
-	done
+	@echo "==> linux/arm64"; \
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+		go build -trimpath -ldflags "$(LDFLAGS) -s -w" \
+		-o $(BIN_DIR)/$(PROJECT)-linux-arm64 $(MAIN_PATH)
+	@echo "==> linux/armv7"; \
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 \
+		go build -trimpath -ldflags "$(LDFLAGS) -s -w" \
+		-o $(BIN_DIR)/$(PROJECT)-linux-armv7 $(MAIN_PATH)
 
 .PHONY: run
 run: build ## 构建并本地运行
