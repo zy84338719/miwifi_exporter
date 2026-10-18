@@ -3,12 +3,29 @@
 小米路由器（MiWiFi）的 Prometheus exporter。
 
 [![CI](https://github.com/zy84338719/miwifi_exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/zy84338719/miwifi_exporter/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-1.17.0-orange)](CHANGELOG.md)
 [![Go](https://img.shields.io/badge/go-1.26%2B-blue)](https://go.dev)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 一个进程采多台路由器，每台独立登录、独立固件适配、独立熔断与超时。
 
 ![grafana](screenshot-2.png)
+
+> ### ⚠️ 从 1.16.0 升级到 1.17.0 请先看这里
+>
+> 本版本有一个**破坏性变更**：所有指标新增 `host` 标签。
+>
+> 绝大多数 PromQL 不受影响（不写标签的匹配器照常匹配）；受影响的只有
+> **写死完整标签集**的精确匹配式，补上 `host="…"` 即可：
+>
+> ```
+> # 升级前
+> miwifi_device_upload_traffic{ip="192.168.31.100", mac="…", device_name="…", is_ap="0"}
+> # 升级后
+> miwifi_device_upload_traffic{host="living-room", ip="192.168.31.100", mac="…", device_name="…", is_ap="0"}
+> ```
+>
+> 指标名本身一个都没改。完整迁移说明见 [CHANGELOG](CHANGELOG.md) 顶部。
 
 ---
 
@@ -131,13 +148,13 @@ ROUTERS='[{"ip":"192.168.31.1","password":"…","host":"a","profile":"no-scan"},
 
 配置文件里可以直接写时长字符串：`"routerTimeout": "8s"`。
 
-### ⚠️ 破坏性变更：所有指标都加了 `host` 标签
+### 为什么所有指标都有 `host` 标签
 
-见 [CHANGELOG](CHANGELOG.md) 的完整说明。一句话：
 **`host` 是多路由器的硬前提**——原来只有一半指标带它，缺的那些在多台时会真的
-撞车，Prometheus 直接报 duplicate metrics。
+撞车，Prometheus 在 Gather 阶段直接报 `duplicate metrics`。
 
 绝大多数 PromQL 不受影响；受影响的只有写死完整标签集的精确匹配式。
+完整迁移说明见 [CHANGELOG](CHANGELOG.md)。
 
 ### 隔离性
 

@@ -1,6 +1,18 @@
 PROJECT   = miwifi-exporter
 MAIN_PATH = .
-VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# 版本优先级：git tag > VERSION 文件 > dev。
+#
+# 之前直接用 `git describe --tags --always`，在没有 tag 时只会吐出一串
+# commit sha，`./miwifi-exporter -version` 显示 "3e7d062-dirty" 这种
+# 对使用者毫无意义的东西。
+VERSION   ?= $(shell \
+	if git describe --tags --match 'v[0-9]*' >/dev/null 2>&1; then \
+		git describe --tags --match 'v[0-9]*' --dirty; \
+	elif [ -f VERSION ]; then \
+		cat VERSION; \
+	else \
+		echo dev; \
+	fi)
 DATE      ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS   := -X main.version=$(VERSION) -X main.buildDate=$(DATE)
 BIN_DIR   = bin

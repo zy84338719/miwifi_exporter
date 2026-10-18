@@ -1,13 +1,50 @@
 # Changelog
 
-本文件记录相对 **v1（重构前）** 的全部变更。
+---
 
-## v2.0.0
+## ⚠️ 1.17.0 含破坏性变更
+
+**升级前请先读完这一节。**
+
+### 全部指标新增 `host` 标签
+
+v1.16.0 只有一半指标带 `host`：
+
+| 已有 `host` | 没有 `host` |
+|---|---|
+| `cpu_*` `memory_*` `count_*` `uptime` `wan_*` `lan_*` `wifi_sta_count` `mesh_*` | `platform` `version` `sn` `mac` `ipv4*` `ipv6` `device_*` `wifi_detail` `wifi_device_signal` `neighbor_wifi_*` |
+
+**影响哪些查询**
+
+| 查询写法 | 影响 |
+|---|---|
+| `miwifi_cpu_cores` | 不受影响 |
+| `sum(miwifi_device_upload_traffic)` | 不受影响 |
+| `miwifi_platform{platform="RB03"}` | 不受影响（没写 host 的匹配器照常匹配） |
+| `miwifi_device_upload_traffic{ip="x",mac="y",device_name="z",is_ap="0"}` | **失配**，需补 `host="…"` |
+| `sum by (host) (...)` | 新增能力：跨路由器聚合 |
+
+**为什么必须改**：多路由器场景下，没有 `host` 的那半边会与另一台路由器的同名序列
+真的撞车，Prometheus 在 Gather 阶段直接报 `duplicate metrics`。不补 `host`，
+多路由器功能无法实现——这不是取舍，是前提。
+
+**怎么排查**：升级后若某条查询返回空，先确认它是不是写全了标签集；若是，
+补上 `host` 即可。指标名本身一个都没改。
+
+---
+
+## 1.17.0
 
 基于 [oekit](https://oekit.github.io/) 模块矩阵整体重写：日志、配置、并发控制、
 HTTP 服务、生命周期全部换成 oekit 组件，并新增多路由器与固件适配能力。
+版本号沿用上游 1.x 发布线（上游最后一个是 1.16.0），本 fork 从 1.17.0 继续。
 
-### ⚠️ 破坏性变更
+> 关于为什么破坏性变更仍用小版本号：这是 fork 的版本策略选择，
+> 上游并不发这个版本，因此不存在与上游发布线的冲突。若你更倾向用大版本
+> 表达破坏性变更，可自行改为 `2.0.0`——只需改 `VERSION`、
+> `Chart.yaml` 的 `appVersion` 与本文件的标题。
+
+### 破坏性变更
 
 #### 所有指标都增加了 `host` 标签
 
