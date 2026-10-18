@@ -162,6 +162,12 @@ func assignRouters(cfg *Config, list []Router) error {
 		if r.Host == "" {
 			r.Host = r.IP
 		}
+		// 每台都要校验 host：它是指标标签的一部分，带空格/引号/反斜杠
+		// 会污染时序库里的标签值。旧实现只校验了单路由器的 ROUTER_HOST，
+		// routers 数组里的 host 一直是裸奔的。
+		if err := ValidateRouterHost(r.Host); err != nil {
+			return oerr.Wrap(err, "router host 标签非法", "ip", r.IP, "host", r.Host)
+		}
 		if prev, dup := seen[r.Host]; dup {
 			return oerr.NewBadRequestError(fmt.Sprintf(
 				"两台路由器的 host 标签相同（%q，见第 %d 台与第 %d 台）：导出的指标会在标签上撞车，"+

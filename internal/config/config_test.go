@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -372,5 +373,70 @@ func TestParseEndpointTimeoutsErrorNamesField(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bad-entry") {
 		t.Errorf("错误信息应指出具体项，实际: %v", err)
+	}
+}
+
+// TestRouterHostValidation 表驱动覆盖每台路由器的 host 校验。
+//
+// 这条路径曾是裸奔的：ValidateRouterHost 只作用于单路由器的 ROUTER_HOST，
+// routers 数组里的 host 从来没被检查过，带空格/引号的 host 能一路进到
+// 指标标签里。
+func TestRouterHostValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		host    string
+		omit    bool // 省略 host 字段（应回落到 IP）
+		wantErr string
+	}{
+		{name: "正常 host", host: "living-room"},
+		{name: "中文 host", host: "客厅"},
+		{name: "含空格", host: "living room", wantErr: "非法字符"},
+		{name: "含引号", host: `has"quote`, wantErr: "非法字符"},
+		{name: "含反斜杠", host: `back\slash`, wantErr: "非法字符"},
+		{name: "含换行", host: "a\nb", wantErr: "非法字符"},
+		{name: "省略 host → 用 IP", omit: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := map[string]any{
+				"routers": []map[string]any{{"ip": "192.168.31.1", "password": "pw"}},
+			}
+			if !tc.omit {
+				raw["routers"].([]map[string]any)[0]["host"] = tc.host
+			}
+			data, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatalf("构造配置失败: %v", err)
+			}
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatalf("写配置失败: %v", err)
+			}
+
+			cfg, err := config.Load(path)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("期望报错（%s），实际成功: %+v", tc.wantErr, cfg)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("错误信息 %q 未包含 %q", err.Error(), tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load 失败: %v", err)
+			}
+			if len(cfg.Routers) != 1 {
+				t.Fatalf("路由器数 = %d", len(cfg.Routers))
+			}
+			want := tc.host
+			if tc.omit {
+				want = "192.168.31.1" // 省略时回落到 IP
+			}
+			if cfg.Routers[0].Host != want {
+				t.Errorf("Host = %q，期望 %q", cfg.Routers[0].Host, want)
+			}
+		})
 	}
 }
