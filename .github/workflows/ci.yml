@@ -5,10 +5,11 @@ name: ci
 #   docker —— 构建并推送多架构镜像（amd64 + arm64 + arm/v7），再做一次真机冒烟
 on:
   push:
-    branches: [main, master]
+    # 主干已由 master 改名为 main，这里只保留 main。
+    branches: [main]
     tags: ['v*']
   pull_request:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
