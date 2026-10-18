@@ -691,3 +691,142 @@ func TestIPv6EmptyAddressIsSkipped(t *testing.T) {
 		t.Errorf("miwifi_ipv6 导出 = %v，期望恰好一条 240e::1（空串应被跳过）", values)
 	}
 }
+
+// TestIdentitylessEntityIsNotExported 守住「没有实体就没有序列」在设备侧的落实。
+//
+// 真机（10.10.30.71）上 10.10.30.248 会把一批设备汇总成一条
+// mac="" device_name="Others" 的记录，旧实现照单全收，导出成
+//
+//	miwifi_device_upload_traffic{mac="",device_name="Others",ip="",is_ap=""} 2.04e+09
+//
+// 这条序列没有 MAC 就无法定位，还会在 sum by (mac) 时混进一个空桶。
+// 真机上这两类各有 2~3 条，长期挂在 Prometheus 里。
+//
+// 另一半是**不该动**的：MAC 有效但查不到 IP 的终端仍要导出，
+// ip="" 是在诚实地说「IP 未知」，不是「这台机器不存在」。
+func TestIdentitylessEntityIsNotExported(t *testing.T) {
+	fake := testutil.NewFakeRouter(t)
+
+	// status.dev：混入一条 mac 为空的「Others」汇总记录
+	fake.SetPayload("api/misystem/status", `{
+		"code": 0,
+		"mem": {"usage": 0.375, "total": "256MB", "hz": "1.2GHz"},
+		"count": {"all": 3, "online": 3, "all_without_mash": 3, "online_without_mash": 3},
+		"hardware": {"mac": "AA:BB:CC:DD:EE:FF", "platform": "R8500", "version": "2.28.46", "sn": "SN0001"},
+		"upTime": "86400", "cpu": {"core": 4, "hz": "1.2GHz", "load": 0.18},
+		"wan": {"downspeed": "1", "upspeed": "1", "upload": "1", "download": "1"},
+		"dev": [
+			{"mac": "11:22:33:44:55:66", "devname": "phone", "upload": 1024, "download": 2048},
+			{"mac": "AA:BB:CC:DD:EE:FF", "devname": "laptop", "upload": 2048, "download": 4096},
+			{"mac": "", "devname": "Others", "upload": 999, "download": 888},
+			{"mac": "   ", "devname": "Others", "upload": 777, "download": 666}
+		]
+	}`)
+
+	// device_list：混入一条 mac 为空的记录
+	fake.SetPayload("api/misystem/device_list", `{
+		"code": 0, "devices": [
+			{"mac": "11:22:33:44:55:66", "name": "phone", "oname": "phone", "isap": 0,
+			 "connectionType": 3, "wifi_quality": 4, "ip": "192.168.31.100", "pcontrol": {"enabled": 1}},
+			{"mac": "", "name": "ghost", "oname": "ghost", "isap": 0,
+			 "connectionType": 1, "wifi_quality": 1, "ip": "192.168.31.199", "pcontrol": {"enabled": 0}}
+		]
+	}`)
+
+	// wifi_connect_devices：混入空 mac
+	fake.SetPayload("api/xqnetwork/wifi_connect_devices", `{
+		"code": 0, "list": [
+			{"mac": "11:22:33:44:55:66", "signal": 88, "wifiIndex": 1},
+			{"mac": "", "signal": 50, "wifiIndex": 2}
+		]
+	}`)
+
+	// wifi_list：混入空 bssid（邻居 AP 没有身份就没法定位）
+	fake.SetPayload("api/xqnetwork/wifi_list", `{
+		"code": 0, "list": [
+			{"band": "2.4G", "ssid": "Neighbor", "bssid": "DD:DD:DD:DD:DD:DD", "rssi": -55, "channel": 6},
+			{"band": "5G", "ssid": "", "bssid": "", "rssi": -70, "channel": 36}
+		]
+	}`)
+
+	client, err := router.New(router.Options{
+		BaseURL:  fake.URL(),
+		Password: "test-password",
+		Timeout:  3 * time.Second,
+		Retry:    retry.Config{Attempts: 1},
+	})
+	if err != nil {
+		t.Fatalf("构造 router.Client 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+	got := gather(t, gatherRegistry(t, newCollector(t, client, "miwifi", "testhost")))
+
+	assertNoEmptyIdentity := func(metric, identity string) {
+		t.Helper()
+		series := got[metric]
+		if series == nil {
+			return
+		}
+		for _, m := range series.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == identity && strings.TrimSpace(lp.GetValue()) == "" {
+					t.Errorf("%s 导出了 %s=\"\" 的无身份序列，其余标签: %v",
+						metric, identity, m.GetLabel())
+				}
+			}
+		}
+	}
+
+	for _, metric := range []string{
+		"miwifi_device_upload_traffic",
+		"miwifi_device_download_traffic",
+		"miwifi_device_wifi_quality",
+		"miwifi_device_connection_type",
+		"miwifi_device_pcontrol",
+		"miwifi_wifi_device_signal",
+	} {
+		assertNoEmptyIdentity(metric, "mac")
+	}
+	assertNoEmptyIdentity("miwifi_neighbor_wifi_rssi", "bssid")
+
+	// 「Others」那条不能混进来，但两台真机必须还在
+	assertHas := func(metric string, want map[string]string) {
+		t.Helper()
+		series := got[metric]
+		if series == nil {
+			t.Fatalf("%s 完全没导出", metric)
+		}
+		for _, m := range series.GetMetric() {
+			match := true
+			for k, v := range want {
+				found := false
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == k && lp.GetValue() == v {
+						found = true
+					}
+				}
+				if !found {
+					match = false
+					break
+				}
+			}
+			if match {
+				return
+			}
+		}
+		t.Errorf("%s 缺少实体 %v", metric, want)
+	}
+	assertHas("miwifi_device_upload_traffic", map[string]string{"mac": "11:22:33:44:55:66", "ip": "192.168.31.100"})
+	assertHas("miwifi_device_upload_traffic", map[string]string{"mac": "AA:BB:CC:DD:EE:FF", "ip": "192.168.31.101"})
+	assertHas("miwifi_device_wifi_quality", map[string]string{"mac": "11:22:33:44:55:66"})
+	assertHas("miwifi_wifi_device_signal", map[string]string{"mac": "11:22:33:44:55:66"})
+	assertHas("miwifi_neighbor_wifi_rssi", map[string]string{"bssid": "DD:DD:DD:DD:DD:DD"})
+
+	// 邻居总数仍然按路由器上报的条数算，与是否导出序列无关
+	if fam := got["miwifi_neighbor_wifi_count"]; fam == nil {
+		t.Error("miwifi_neighbor_wifi_count 完全没导出")
+	} else if v := fam.GetMetric()[0].GetGauge().GetValue(); v != 2 {
+		t.Errorf("miwifi_neighbor_wifi_count = %v，期望 2（跳过无身份序列不应改变计数）", v)
+	}
+}

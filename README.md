@@ -3,13 +3,21 @@
 小米路由器（MiWiFi）的 Prometheus exporter。
 
 [![CI](https://github.com/zy84338719/miwifi_exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/zy84338719/miwifi_exporter/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-1.17.1-orange)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.18.0-orange)](CHANGELOG.md)
 [![Go](https://img.shields.io/badge/go-1.26%2B-blue)](https://go.dev)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
 一个进程采多台路由器，每台独立登录、独立固件适配、独立熔断与超时。
 
 ![grafana](screenshot-2.png)
+
+> ### ⚠️ 从 1.17.x 升级到 1.18.0 请先看这里
+>
+> 1.18.0 的破坏性变更只有一条：**空标签序列不再导出**（`ipv4=""`、
+> `mac="" device_name="Others"` 这类）。指标名、标签集合、取值语义全部没动，
+> 没有任何 PromQL 会因此写错；只是恰好在数「空标签序列」的查询会变少。
+>
+> 原因与完整清单见 [CHANGELOG](CHANGELOG.md) 的 1.18.0 一节。
 
 > ### ⚠️ 从 1.16.0 升级到 1.17.0 请先看这里
 >
@@ -203,9 +211,21 @@ profile 会让它们**导出的指标不一样**，更糟的是真机验证时�
 这类每台必定导出，取不到就发 0，绝不因为某台没数据就整条消失。
 `wan_negotiation_speed` 就是因此修的（实测两台里有一台没上报该字段）。
 
-**按实体**的指标（`ipv4` / `device_*` / `wifi_detail` / `lan_port_link` /
-`neighbor_wifi_rssi` / `wifi_device_signal`）不在此列：每个实体一条序列，
+**按实体**的指标（`ipv4` / `ipv4_mask` / `ipv6` / `device_*` / `wifi_detail` /
+`lan_port_link` / `neighbor_wifi_rssi` / `wifi_device_signal`）不在此列：每个实体一条序列，
 没有实体就没有序列，这是 Prometheus 固有语义。
+
+> 从 **1.18.0** 起这条规则真的落到了代码上。某些固件在拿不到数据时会返回
+> 空占位记录——`wan_info.ipv4` 里一条 `ip`/`mask` 全空的项，`status.dev` 里一条
+> `mac="" device_name="Others"` 的汇总项。这些不是实体，导出成空标签序列后
+> 既无法定位，又会在 `sum by (mac)` 里混进一个空桶。现在一律跳过。
+>
+> 有身份但字段缺失的设备**仍然导出**：MAC 有效而查不到 IP 时 `ip=""`，
+> 意思是「IP 未知」，不是「这台机器不存在」。按设备维度查询请用
+> `mac` 或 `device_name` 匹配。
+>
+> 例外是 `wan_info`：它虽可能出现空标签，但已被归入上面的「聚合指标恒定存在」，
+> 且 `wan_link_status{host}` 完整表达了 WAN 通断，刻意保持原样。
 
 ---
 
@@ -449,13 +469,15 @@ internal/testutil/   测试用假路由器（可注入延迟/404/故障，不进
 
 ### 测试
 
-96 个测试函数，覆盖率 76.8%，全部 `-race` 通过。
+104 个测试函数，覆盖率 77.3%，全部 `-race` 通过。
 
 | 测试 | 守住什么 |
 |---|---|
 | `collector/compat_test.go` `TestLegacyMetricContract` | 指标名与标签集合与旧版逐条一致 |
 | `collector/compat_test.go` `TestEndpointSupportedIsCorrectOnFirstGather` | 自监控指标不滞后一拍 |
 | `collector/set_test.go` `TestAggregateMetricsPresentForEveryRouter` | 各台聚合指标集合一致 |
+| `collector/compat_test.go` `TestEmptyOrBrokenWANAddressIsNotExported` | 空地址 / 坏掩码不产出序列，也不谎报 /0 |
+| `collector/compat_test.go` `TestIdentitylessEntityIsNotExported` | 「Others」这类无身份记录不伪装成设备 |
 | `collector/set_test.go` `TestSetOneSlowRouterDoesNotBlockOthers` | 慢机不拖累快机 |
 | `collector/context_test.go` `TestClientDisconnectDoesNotPolluteRouterHealth` | 客户端断开不污染 `router_up` |
 | `collector/set_test.go` `TestEndpointErrorCounterIncrements` | 端点失败路径不打 panic |

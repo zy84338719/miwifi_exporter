@@ -344,6 +344,13 @@ func (c *Collector) emitDevices(ch chan<- prometheus.Metric, s *router.Snapshot)
 	}
 
 	for _, dev := range s.Status.Dev {
+		// 没有 MAC 就是没有身份：路由器把一批设备汇总成了一条
+		// mac="" device_name="Others" 的记录，它不是一个可定位的终端。
+		// MAC 有效但查不到 IP 的设备仍然导出——那是真实终端，
+		// ip="" 诚实表示「IP 未知」，而不是「这台机器不存在」。
+		if !hasIdentity(dev.Mac) {
+			continue
+		}
 		var devIP, devIsAP string
 		if v, ok := ipIndex[dev.Mac]; ok {
 			devIP, devIsAP = v.ip, v.isAP
@@ -363,6 +370,9 @@ func (c *Collector) emitDevices(ch chan<- prometheus.Metric, s *router.Snapshot)
 	}
 
 	for _, dev := range s.DeviceListV2.Devices {
+		if !hasIdentity(dev.Mac) {
+			continue
+		}
 		name := dev.Name
 		if name == "" {
 			name = dev.OName
@@ -391,13 +401,39 @@ func (c *Collector) emitWiFi(ch chan<- prometheus.Metric, s *router.Snapshot) {
 	emit(ch, c.d.meshReCount, float64(s.NewStatus.ReCount), host)
 
 	for _, d := range s.WifiConnDevs.List {
+		if !hasIdentity(d.Mac) {
+			continue
+		}
 		emit(ch, c.d.wifiDeviceSig, float64(d.Signal), host, d.Mac, c.bandFor(d.WifiIndex))
 	}
 
 	for _, w := range s.WifiList.List {
+		// BSSID 是邻居 AP 的身份。缺了它这条序列就没法定位，
+		// 而这类序列基数又高（README 建议直接 drop），留着纯占资源。
+		if !hasIdentity(w.BSSID) {
+			continue
+		}
 		emit(ch, c.d.neighborWiFiRSSI, float64(w.RSSI), host, w.SSID, w.BSSID, w.Band, strconv.Itoa(w.Channel))
 	}
 	emit(ch, c.d.neighborWiFiCnt, float64(len(s.WifiList.List)), host)
+}
+
+// hasIdentity 判断一个实体是否至少带了一个可用的身份标识。
+//
+// 按实体的指标（device_* / wifi_device_signal / neighbor_wifi_rssi）靠标签
+// 定位实体。全部标签都为空的那条并不是实体，只是路由器把一批设备汇总成的
+// 占位记录——导出成 mac="" 的序列既无法定位，又会在 sum by (mac) 时混进
+// 一个空桶，比少一条序列更难排查。
+//
+// 只看「有没有」，不看「全不全」：MAC 有效但 IP 查不到的终端仍然要导出，
+// ip="" 是在诚实地说「IP 未知」，而不是「这台机器不存在」。
+func hasIdentity(values ...string) bool {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // emit 发送一个常量指标。

@@ -1,7 +1,70 @@
 # Changelog
 
-> **1.17.1 是当前最新版本**（依赖升级 + 内部优化，指标零变化）。
-> 破坏性变更只在 1.17.0，见下。
+> **1.18.0 是当前最新版本**。它含**破坏性变更**：一批无身份的序列不再导出，
+> 见下。1.17.0 的 `host` 标签变更仍然适用。
+
+---
+
+## ⚠️ 1.18.0 含破坏性变更
+
+**没有实体就没有序列**——这句话此前只写在 README 里，这次真的落到了代码上。
+
+### 哪些序列会消失
+
+真机（10.10.30.71，同时采 `192.168.31.1` 与 `10.10.30.248`）上实测会消失的：
+
+```
+miwifi_ipv4{host="…",ipv4=""}                 ← 10.10.30.248 的空占位记录
+miwifi_ipv4_mask{host="…",ipv4=""}             ← 同上，且值 0 会被读成 /0
+miwifi_device_upload_traffic{mac="",device_name="Others",ip="",is_ap=""}
+miwifi_device_download_traffic{mac="",device_name="Others",ip="",is_ap=""}
+```
+
+涉及指标：`ipv4`、`ipv4_mask`、`ipv6`、`device_upload_traffic`、
+`device_download_traffic`、`device_wifi_quality`、`device_connection_type`、
+`device_pcontrol`、`wifi_device_signal`、`neighbor_wifi_rssi`。
+
+### 为什么是破坏性的
+
+上面每一条都是**空标签序列**——所有标签为空，没有任何东西可以用来定位它。
+它们不携带信息，却会稳定占住一条时间序列，并且在 `sum by (mac)` / `sum by (ipv4)`
+这类查询里混进一个空桶。留着比缺一条更难排查：`count(miwifi_device_upload_traffic)`
+会把它们算成「一台设备」。
+
+### 什么没有变
+
+- **指标名、标签集合、取值语义全部没动**，没有任何 PromQL 会因此写错。
+- **有身份的设备一条都没少。** MAC 有效但查不到 IP 的终端仍然导出，
+  `ip=""` 是在诚实地说「IP 未知」，不是「这台机器不存在」。
+- 只影响恰好在查「空标签序列」的查询——这类查询本来就没有意义。
+
+### 排查
+
+升级后若某条查询结果变少，先确认它是不是在数「空 mac / 空 ipv4 的序列」。
+要按设备维度查，请用 `mac` 或 `device_name` 匹配，别用 `ipv4 != ""` 这类条件。
+
+### `ipv4_mask` 不再谎报 /0
+
+子网掩码解析不出来时，旧代码只 Warn 然后照样 `emit(0)`。0 会被读成 `/0` 网段——
+一个根本不存在的巨大网段。现在该序列直接不发。
+
+`subnetMaskToLen` 本身也修了一处：`net.IPMask.Size()` 对非连续掩码
+（如 `255.0.255.0`）返回 `(0, 0)` **且不报错**，旧代码的 `ones, _ :=`
+把这类掩码也当成了 0。现在反查 `net.CIDRMask(ones, 32)` 确认是规范化形式。
+
+### `wan_info` 刻意不动
+
+`wan_info{wan_ip="",gateway="",dns=""}` 同样是空标签序列，但**保持原样**：
+README 已把它归入「聚合指标恒定存在，取不到也发 0」这一类，且
+`wan_link_status{host}`（2 = 已连接）已经完整表达了「WAN 通不通」。
+为了少数几台 WAN 异常的机器去掉一条承诺过的序列，不划算。
+
+### 其他
+
+- 修 `make build-all`：`GOARCH=armv7` 不是合法取值，该目标此前必然失败。
+  改为 `GOARCH=arm GOARM=7`。
+- 新增 `deploy/arm64-local.Dockerfile`：无 Go 环境的 ARM 设备（如树莓派）
+  可用它把交叉编译好的二进制打成镜像，不必推 registry。
 
 ---
 
