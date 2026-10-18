@@ -208,13 +208,20 @@ func (m *selfMetrics) Observe(mode string, elapsed time.Duration, snap *router.S
 		return
 	}
 
-	healthy := true
+	// router_up 的语义是「这台路由器我们采到数据了吗」，而不是
+	// 「每一个端点都成功了吗」。
+	//
+	// 最初写成后者，真机上立刻暴露问题：一台 R3P 老机器不支持
+	// pppoe_status，于是 7 个端点里 1 个失败就把整台判成不可达，
+	// router_up 恒为 0、告警一直误报——而这台其实数据正常。
+	// 端点级健康本来就有 endpoint_up{endpoint} 表达，不必再叠一层。
+	anyOK := false
 	for name, st := range snap.Endpoint {
 		up, stale := 0.0, 0.0
 		if st.OK {
 			up = 1
+			anyOK = true
 		} else {
-			healthy = false
 			m.endpointErrors.WithLabelValues(h, name).Inc()
 		}
 		if st.Stale {
@@ -225,12 +232,25 @@ func (m *selfMetrics) Observe(mode string, elapsed time.Duration, snap *router.S
 		m.endpointDur.WithLabelValues(h, name).Set(st.Elapsed.Seconds())
 	}
 
+	// scrape_total 的 success/partial 仍按「是否所有端点都成功」分档——
+	// 它是给排障看的细节粒度，不用于告警，因此保留严格语义。
 	result := "success"
-	if !healthy {
-		result = "partial"
+	if len(snap.Endpoint) > 0 {
+		allOK := true
+		for _, st := range snap.Endpoint {
+			if !st.OK {
+				allOK = false
+				break
+			}
+		}
+		if !allOK {
+			result = "partial"
+		}
 	}
 	m.scrapeTotal.WithLabelValues(h, mode, result).Inc()
-	m.routerUp.WithLabelValues(h).Set(boolToFloat(healthy))
+
+	// 告警口径：采到任意端点即视为可达。
+	m.routerUp.WithLabelValues(h).Set(boolToFloat(anyOK))
 
 	if !snap.CollectedAt.IsZero() {
 		m.snapshotAge.WithLabelValues(h).Set(time.Since(snap.CollectedAt).Seconds())

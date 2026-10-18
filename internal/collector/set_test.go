@@ -465,13 +465,39 @@ func TestEndpointErrorCounterIncrements(t *testing.T) {
 		map[string]string{"host": "r1", "endpoint": profile.EPStatus}); v != 0 {
 		t.Errorf("status 没失败，endpoint_errors_total 应为 0，实际 %v", v)
 	}
-	// 关键：失败的端点也必须照常产出 router_up，只是值为 0。
-	if v := mustLookup(t, fams, "miwifi_exporter_router_up", map[string]string{"host": "r1"}); v != 0 {
-		t.Errorf("有端点失败时 router_up 应为 0，实际 %v", v)
+	// router_up 表达的是「这台采到数据了吗」，不是「每个端点都成功了吗」。
+	// 真机上遇到过：一台 R3P 不支持 pppoe_status，7 个端点里 1 个失败就把
+	// 整台判成不可达，告警一直误报——而那台的数据其实完全正常。
+	if v := mustLookup(t, fams, "miwifi_exporter_router_up", map[string]string{"host": "r1"}); v != 1 {
+		t.Errorf("有 8/9 端点成功时 router_up 应为 1（可采到数据），实际 %v", v)
 	}
 	// 聚合指标不能因为单个端点失败而消失。
 	if _, ok := lookup(t, fams, "miwifi_cpu_cores", map[string]string{"host": "r1"}); !ok {
 		t.Error("单个端点失败不应导致其它指标消失")
+	}
+}
+
+// TestRouterUpZeroOnlyWhenNothingCollected 守住 router_up=0 的唯一含义：
+// 一个端点都没采到。
+func TestRouterUpZeroOnlyWhenNothingCollected(t *testing.T) {
+	// 每个端点都返回空响应（code=0 但无数据）→ 端点层面「成功」，
+	// 但这里要的是「全失败」的形态：让客户端拿不到任何东西。
+	dead := testutil.NewFakeRouter(t)
+	for apiPath := range testutil.SamplePayloads {
+		dead.SetPayload(apiPath, `not json at all`)
+	}
+
+	set, err := collector.NewSet([]collector.RouterSpec{
+		newSpec(t, dead, "dead", 5*time.Second),
+	}, collector.SetOptions{Namespace: "miwifi", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewSet 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close(context.Background()) })
+
+	fams := gatherSet(t, set)
+	if v := mustLookup(t, fams, "miwifi_exporter_router_up", map[string]string{"host": "dead"}); v != 0 {
+		t.Errorf("所有端点都失败时 router_up 应为 0，实际 %v", v)
 	}
 }
 

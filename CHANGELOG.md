@@ -55,6 +55,21 @@ v1.16.0 只有一半指标带 `host`：
 - **新增并发压力测试**：stok 持续剧变下的 48 路并发采集、goroutine 泄漏、
   ctx 取消不阻塞三个场景。此前 `-race` 只在正常路径上跑过。
 
+### 指标语义修正：`router_up`
+
+`router_up{host}` 的含义从「所有端点都成功」改为「**这台路由器我们采到数据了吗**」。
+
+真机上踩到的：一台 R3P 老机器不支持 `pppoe_status`，于是 7 个端点里 1 个失败
+就把整台判成不可达，`router_up` 恒为 0、告警一直误报——而那台的数据完全正常。
+
+端点级健康本来就有 `endpoint_up{host,endpoint}` 表达，不必再叠一层到整机指标上。
+
+- `router_up == 0` 现在**只**在「一个端点都没采到」时出现
+- `scrape_total{result="success"|"partial"}` 仍按严格口径分档，供排障使用
+
+**如果你在 1.17.0/1.17.1 上配过 `router_up == 0` 告警，升级后触发会明显变少**
+——那是因为之前在误报。
+
 ### 内部简化（无行为变化）
 
 - `middleware` v0.8.0 起 `StackConfig.SkipPaths` 已贯通 Response，
