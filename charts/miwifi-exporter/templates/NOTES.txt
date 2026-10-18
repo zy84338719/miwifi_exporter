@@ -1,16 +1,46 @@
-1. Get the application URL by running these commands:
+miwifi-exporter {{ .Chart.AppVersion }} 已部署（namespace: {{ .Release.Namespace }}）
+
+采集模式: {{ .Values.wifiSettings.collectMode }}
+{{- if eq .Values.wifiSettings.collectMode "poll" }}
+采集间隔: {{ .Values.wifiSettings.collectInterval }}（scrape 只读内存快照，指标新鲜度由此决定）
+{{- else }}
+采集方式: scrape 时实时向路由器取值（SCRAPE_TIMEOUT={{ .Values.wifiSettings.scrapeTimeout }}）
+{{- end }}
+
+1. 访问 metrics：
 {{- if contains "NodePort" .Values.service.type }}
   export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "miwifi-exporter.fullname" . }})
   export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
-  echo http://$NODE_IP:$NODE_PORT
+  echo http://$NODE_IP:$NODE_PORT{{ .Values.wifiSettings.metricsPath | default "/metrics" }}
 {{- else if contains "LoadBalancer" .Values.service.type }}
      NOTE: It may take a few minutes for the LoadBalancer IP to be available.
-           You can watch its status by running 'kubectl get --namespace {{ .Release.Namespace }} svc -w {{ include "miwifi-exporter.fullname" . }}'
   export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "miwifi-exporter.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
-  echo http://$SERVICE_IP:{{ .Values.service.port }}
+  echo http://$SERVICE_IP:{{ .Values.service.port }}{{ .Values.wifiSettings.metricsPath | default "/metrics" }}
 {{- else if contains "ClusterIP" .Values.service.type }}
   export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "miwifi-exporter.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
-  export CONTAINER_PORT=$(kubectl get pod --namespace {{ .Release.Namespace }} $POD_NAME -o jsonpath="{.spec.containers[0].ports[0].containerPort}")
-  echo "Visit http://127.0.0.1:8080 to use your application"
-  kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 8080:$CONTAINER_PORT
+  kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 8080:{{ .Values.service.port }}
+  echo http://127.0.0.1:8080{{ .Values.wifiSettings.metricsPath | default "/metrics" }}
 {{- end }}
+
+2. 健康检查端点：
+   /livez    进程存活（恒 200，K8s livenessProbe 用）
+   /readyz   就绪状态（K8s readinessProbe 用）
+   /healthz  健康检查
+
+3. 建议配置的告警：
+
+   # 路由器不可达
+   miwifi_exporter_router_up == 0
+
+   # 数据陈旧（路由器部分接口异常）
+   miwifi_exporter_endpoint_stale == 1
+
+   # 数据新鲜度过低（poll 模式下采集循环可能卡住）
+   miwifi_exporter_snapshot_age_seconds > 120
+
+   # 抓取持续失败
+   increase(miwifi_exporter_scrape_total{result!="success"}[10m]) > 0
+
+4. 提示：路由器密码目前来自 values 或 Secret。生产环境建议用
+   existingSecret 引用已有的 Secret，避免明文进入 helm release 记录：
+   helm upgrade ... --set existingSecret=my-router-secret

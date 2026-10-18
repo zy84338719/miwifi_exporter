@@ -34,13 +34,74 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- if .Values.wifiSettings.routersConfigSecret }}
+            - "-config"
+            - "/etc/miwifi/config.json"
+            {{- else }}
+            - "-config"
+            - "/etc/miwifi/config.json"
+            {{- end }}
           env:
+            {{- if .Values.wifiSettings.routersConfigSecret }}
+            {{- /* 多台模式：config.json 整体来自 Secret，密码不落 values / release 记录 */}}
+            {{- with .Values.wifiSettings.routersConfigTimeout }}
+            - name: ROUTER_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.wifiSettings.defaultProfile }}
+            - name: ROUTER_PROFILE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- else }}
             - name: ROUTER_IP
-              value: {{ .Values.wifiSettings.routerIp }}
+              value: {{ required "wifiSettings.routerIp 必填" .Values.wifiSettings.routerIp | quote }}
+            {{- if .Values.existingSecret }}
             - name: ROUTER_PASSWORD
-              value: {{ .Values.wifiSettings.routerPassword }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: {{ .Values.existingSecretPasswordKey }}
+            {{- else }}
+            - name: ROUTER_PASSWORD
+              value: {{ required "wifiSettings.routerPassword 必填（或改用 existingSecret）" .Values.wifiSettings.routerPassword | quote }}
+            {{- end }}
             - name: ROUTER_HOST
-              value: {{ .Values.wifiSettings.routerHost }}
+              value: {{ .Values.wifiSettings.routerHost | default "miwifi" | quote }}
+            - name: ROUTER_TIMEOUT
+              value: {{ .Values.wifiSettings.routerTimeout | quote }}
+            - name: ROUTER_PORT
+              value: {{ .Values.service.port | quote }}
+            - name: METRICS_PATH
+              value: {{ .Values.wifiSettings.metricsPath | quote }}
+            - name: METRICS_NAMESPACE
+              value: {{ .Values.wifiSettings.metricsNamespace | quote }}
+            - name: ROUTER_PROFILE
+              value: {{ .Values.wifiSettings.routerProfile | default "auto" | quote }}
+            {{- if .Values.wifiSettings.collectNeighborWifi }}
+            # 打开后 wifi_list 会触发 WiFi 扫描并阻塞其余端点，
+            # 需要把 Prometheus 的 scrape_timeout 调到 16s 以上。
+            - name: ENDPOINT_TIMEOUTS
+              value: "wifi_list=20s"
+            {{- end }}
+            {{- with .Values.wifiSettings.excludeEndpoints }}
+            - name: EXCLUDE_ENDPOINTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            - name: LOG_LEVEL
+              value: {{ .Values.wifiSettings.logLevel | quote }}
+            - name: COLLECT_MODE
+              value: {{ .Values.wifiSettings.collectMode | quote }}
+            {{- if eq .Values.wifiSettings.collectMode "poll" }}
+            - name: COLLECT_INTERVAL
+              value: {{ .Values.wifiSettings.collectInterval | quote }}
+            {{- end }}
+            - name: SCRAPE_TIMEOUT
+              value: {{ .Values.wifiSettings.scrapeTimeout | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
@@ -51,14 +112,31 @@ spec:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- with .Values.volumeMounts }}
           volumeMounts:
+            - name: config
+              mountPath: /etc/miwifi
+              readOnly: true
+            {{- with .Values.volumes }}
             {{- toYaml . | nindent 12 }}
-          {{- end }}
-      {{- with .Values.volumes }}
+            {{- end }}
       volumes:
+        - name: config
+          {{- if .Values.wifiSettings.routersConfigSecret }}
+          secret:
+            secretName: {{ .Values.wifiSettings.routersConfigSecret }}
+            items:
+              - key: {{ .Values.wifiSettings.routersConfigKey | default "config.json" }}
+                path: config.json
+          {{- else }}
+          configMap:
+            name: {{ include "miwifi-exporter.fullname" . }}-config
+            items:
+              - key: config.json
+                path: config.json
+          {{- end }}
+        {{- with .Values.volumes }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

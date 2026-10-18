@@ -1,18 +1,49 @@
-version: "3"
-
 services:
   miwifi-exporter:
-    build: .
+    build:
+      context: .
+      args:
+        VERSION: dev
     image: miwifi-exporter:latest
     container_name: miwifi-exporter
     restart: always
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
         max-size: "10m"
+        max-file: "3"
     ports:
       - "9001:9001"
+    # 多台路由器：把 routers.json 挂进来即可（推荐，密码不落 env）
+    # volumes:
+    #   - ./routers.json:/etc/miwifi/config.json:ro
+    # command: ["-config", "/etc/miwifi/config.json"]
+    #
+    # 或者直接用环境变量（JSON 数组）：
+    # environment:
+    #   ROUTERS: '[{"ip":"192.168.31.1","password":"…","host":"a","profile":"no-scan"}]'
     environment:
-      - ROUTER_IP=xxx
-      - ROUTER_PASSWORD=xxx
-      - ROUTER_HOST=xxx
+      # ---- 必填（单台模式）----
+      - ROUTER_IP=192.168.31.1
+      - ROUTER_PASSWORD=your-router-password
+      # ---- 常用可选 ----
+      # wifi_list 会触发 WiFi 扫描并阻塞其余端点，强烈建议 no-scan
+      - ROUTER_PROFILE=no-scan
+      # - ROUTER_HOST=miwifi          # host 标签取值
+      # - ROUTER_PORT=9001            # exporter 自身监听端口
+      # - METRICS_PATH=/metrics
+      # - METRICS_NAMESPACE=miwifi
+      # - LOG_LEVEL=info
+      # ---- 采集 ----
+      # - COLLECT_MODE=pull           # pull=scrape 时实时取数；poll=后台轮询
+      # - COLLECT_INTERVAL=30s        # poll 模式的采集间隔
+      # - SCRAPE_TIMEOUT=15s          # pull 模式的单次采集上限
+      # - ROUTER_TIMEOUT=5s           # 单次 HTTP 请求超时
+      # - SHUTDOWN_TIMEOUT=10s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp

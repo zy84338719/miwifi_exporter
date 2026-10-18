@@ -1,5 +1,13 @@
 {
     "ip": "192.168.31.1",
     "password": "",
-    "port": 9001
+    "port": 9001,
+    "host": "miwifi",
+    "collectMode": "pull",
+    "collectInterval": "30s",
+    "scrapeTimeout": "15s",
+    "routerTimeout": "5s",
+    "logLevel": "info",
+    "metricsNamespace": "miwifi",
+    "metricsPath": "/metrics"
 }

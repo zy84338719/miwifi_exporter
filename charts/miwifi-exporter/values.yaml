@@ -1,6 +1,5 @@
 # Default values for miwifi-exporter.
 # This is a YAML-formatted file.
-# Declare variables to be passed into your templates.
 
 replicaCount: 1
 
@@ -15,67 +14,77 @@ nameOverride: ""
 fullnameOverride: ""
 
 serviceAccount:
-  # Specifies whether a service account should be created
   create: true
-  # Automatically mount a ServiceAccount's API credentials?
   automount: true
-  # Annotations to add to the service account
   annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template
   name: ""
 
 podAnnotations: {}
 podLabels: {}
 
-podSecurityContext: {}
-  # fsGroup: 2000
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
 
-securityContext: {}
-  # capabilities:
-  #   drop:
-  #   - ALL
-  # readOnlyRootFilesystem: true
-  # runAsNonRoot: true
-  # runAsUser: 1000
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
 
 service:
   type: ClusterIP
   port: 9001
 
-resources: {}
-  # We usually recommend not to specify default resources and to leave this as a conscious
-  # choice for the user. This also increases chances charts run on environments with little
-  # resources, such as Minikube. If you do want to specify resources, uncomment the following
-  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-  # limits:
-  #   cpu: 100m
-  #   memory: 128Mi
-  # requests:
-  #   cpu: 100m
-  #   memory: 128Mi
+# ServiceMonitor 需要的标签（Prometheus Operator 场景）
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 15s
+  labels: {}
+  # 额外 relabel 规则，例如按 routerHost 区分实例
+  relabelings: []
+  metricRelabelings: []
 
+resources:
+  limits:
+    cpu: 200m
+    memory: 128Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+# 探针刻意分工明确：
+#   liveness  只看进程存活（/livez 恒 200）—— 路由器重启绝不能连带重启 exporter
+#   readiness 看 exporter 是否就绪（/readyz）
+# 「路由器是否可达」不进探针，而是以 miwifi_exporter_router_up 指标暴露，
+# 否则路由器一挂 K8s 就把 Pod 摘出 Service，连告警指标都抓不到了。
 livenessProbe:
   httpGet:
-    path: /
+    path: /livez
     port: http
+  initialDelaySeconds: 5
+  periodSeconds: 20
+  timeoutSeconds: 3
+  failureThreshold: 3
+
 readinessProbe:
   httpGet:
-    path: /
+    path: /readyz
     port: http
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
 
-# Additional volumes on the output Deployment definition.
+extraEnv: []
+# - name: LOG_LEVEL
+#   value: debug
+
 volumes: []
-# - name: foo
-#   secret:
-#     secretName: mysecret
-#     optional: false
-
-# Additional volumeMounts on the output Deployment definition.
-volumeMounts: []
-# - name: foo
-#   mountPath: "/etc/foo"
-#   readOnly: true
 
 nodeSelector: {}
 
@@ -84,6 +93,78 @@ tolerations: []
 affinity: {}
 
 wifiSettings:
+  # ---- 单台（保持旧行为，host 为空则用 ROUTER_HOST 或默认值）----
   routerIp: ""
+  # 建议改用 existingSecret 引用，避免明文进 helm values / release secret
   routerPassword: ""
   routerHost: ""
+
+  # ---- 多台：把含 routers 数组（含密码）的 config.json 放进一个 Secret ----
+  #
+  # 这样密码不进入 helm values 与 release 记录。
+  #
+  #   kubectl create secret generic miwifi-routers \
+  #     --from-file=config.json=./routers.json
+  #   helm upgrade miwifi . --set wifiSettings.routersConfigSecret=miwifi-routers
+  #
+  # routers.json 内容示例：
+  #   {"collectMode":"pull","routers":[
+  #     {"ip":"192.168.31.1","password":"…","host":"living-room","profile":"no-scan"},
+  #     {"ip":"10.10.30.248","password":"…","host":"study","profile":"no-scan"}]}
+  routersConfigSecret: ""
+  routersConfigKey: "config.json"
+  routersConfigTimeout: "8s"
+
+  # ---- 多台（填了就用这个，routerIp/routerPassword 被忽略）----
+  # 每台需要唯一的 host —— 指标以 host 标签区分，两台同 host 会直接启动失败。
+  #
+  # routers:
+  #   - ip: 192.168.31.1
+  #     host: living-room
+  #     passwordFromSecret: miwifi-living-room
+  #     profile: no-scan
+  #   - ip: 10.10.30.248
+  #     host: study
+  #     passwordFromSecret: miwifi-study
+  #     profile: no-scan
+  #     collectMode: poll
+  #     interval: 30s
+  #     excludeEndpoints: ["wifi_list"]
+  #     timeout: 8s
+  routers: []
+  # 多台时共享的 Secret 名（下面每台用 passwordFromSecret 指定 key）
+  routersSecret: ""
+  # 全局默认 profile（多台模式下可被单台的 profile 覆盖）
+  defaultProfile: "no-scan"
+  # 多台场景常用的全局按台超时覆盖
+  endpointTimeouts: []
+  # 多台时全局请求超时；可被单台的 timeout 覆盖
+  timeout: "8s"
+  routerTimeout: "5s"
+  # 采集模式：pull（scrape 实时取数，默认）或 poll（后台轮询 + 缓存）
+  collectMode: "pull"
+  # 固件适配方案：
+  #   auto         自适应探测（默认）
+  #   default      全部 10 个端点
+  #   no-scan      摘掉 wifi_list —— 推荐，见下方说明
+  #   minimal      只采 status + devicelist（极老固件）
+  #   no-xqnetwork 跳过 xqnetwork 系列
+  #
+  # wifi_list 会触发 WiFi 扫描（实测 13–14s），且扫描期间路由器阻塞其余全部
+  # LuCI 请求，导致另外九个端点一起超时。实测：default 下 1/10 端点可用、
+  # 抓取 5s；no-scan 下 9/9 可用、抓取 1–3s。详见 README「真机行为」。
+  routerProfile: "no-scan"
+  # 需要 neighbor_wifi_* 指标时置 false，并接受慢抓取
+  # （同时需要 Prometheus 的 scrape_timeout ≥ 16s）
+  collectNeighborWifi: false
+  # 额外无条件排除的端点（逗号分隔），一般留空
+  excludeEndpoints: []
+  collectInterval: "30s"
+  scrapeTimeout: "15s"
+  logLevel: "info"
+  metricsNamespace: "miwifi"
+  metricsPath: "/metrics"
+
+# 已有 Secret 场景：填 secretName 后 routerPassword 会被忽略
+existingSecret: ""
+existingSecretPasswordKey: "router-password"

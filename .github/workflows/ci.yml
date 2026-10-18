@@ -1,0 +1,222 @@
+name: ci
+
+# 两条流水线：
+#   test   —— gofmt / vet / race 测试 / helm lint
+#   docker —— 构建并推送多架构镜像（amd64 + arm64 + arm/v7），再做一次真机冒烟
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.26'
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -s -l . | grep -v '^$' || true)"
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化，请执行 make fmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race 不是可选项：采集链路全程并发（多台并发、单台十端点并发、
+      # 登录互斥、熔断器），不跑 race 等于没测。
+      - name: test (race)
+        run: go test -race -timeout 5m ./...
+
+      - name: coverage
+        run: |
+          go test -covermode=atomic -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | tail -1
+
+      - name: build
+        run: go build -trimpath -o /tmp/miwifi-exporter .
+
+      - name: upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+      - uses: azure/setup-helm@v4
+
+      - name: helm lint（单台模式）
+        run: |
+          helm lint charts/miwifi-exporter \
+            --set wifiSettings.routerIp=192.168.31.1 \
+            --set wifiSettings.routerPassword=dummy
+
+      - name: helm lint（多台 Secret 模式）
+        run: |
+          helm lint charts/miwifi-exporter --set wifiSettings.routersConfigSecret=miwifi-routers
+
+  docker:
+    name: docker
+    # PR 不推镜像：省掉多架构构建与冒烟
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # fork 没有 GITHUB_TOKEN 写权限，登录会直接失败
+      - name: login ghcr
+        if: github.event.repository.fork == false
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY_IMAGE }}
+            fawenyo/miwifi-exporter
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # 一次多架构构建即完成推送；冒烟测试直接拉取刚推上去的 amd64 变体，
+      # 不重复构建。
+      - name: build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: ${{ github.event.repository.fork == false }}
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: pull amd64 for smoke test
+        if: github.event.repository.fork == false
+        run: |
+          set -euo pipefail
+          tag="$(echo '${{ steps.meta.outputs.tags }}' | head -1)"
+          echo "拉取 $tag (linux/amd64)"
+          docker pull --platform linux/amd64 "$tag"
+          echo "SMOKE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: inspect image metadata
+        if: env.SMOKE_TAG != ''
+        run: |
+          set -euo pipefail
+          docker image inspect "$SMOKE_TAG" --format \
+            'size={{.Size}}B user=[{{.Config.User}}] entrypoint={{json .Config.Entrypoint}} healthcheck={{json .Config.Healthcheck.Test}}'
+
+      - name: smoke test -version
+        if: env.SMOKE_TAG != ''
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /app/miwifi-exporter "$SMOKE_TAG" -version
+
+      - name: smoke test - 缺配置必须非零退出
+        if: env.SMOKE_TAG != ''
+        run: |
+          set -euo pipefail
+          set +e
+          out="$(docker run --rm --entrypoint /app/miwifi-exporter "$SMOKE_TAG" \
+                 -validate-config -config /nonexistent.json 2>&1)"
+          rc=$?
+          set -e
+          echo "$out" | tail -2
+          if [ "$rc" -eq 0 ]; then
+            echo "❌ 缺配置时应当非零退出（否则会带着默认密码静默启动）"
+            exit 1
+          fi
+
+      - name: smoke test - 起服务并抓指标
+        if: env.SMOKE_TAG != ''
+        run: |
+          set -euo pipefail
+          # 192.0.2.1 是 TEST-NET-1， 保证不可路由：这里只验证「exporter 本身
+          # 能在路由器不可达时正常提供 /metrics」，不验证采到数据。
+          docker run -d --name verify -p 19001:9001 \
+            -e ROUTER_IP=192.0.2.1 -e ROUTER_PASSWORD=dummy \
+            -e ROUTER_TIMEOUT=1s -e ROUTER_PROFILE=minimal -e LOG_LEVEL=warn \
+            "$SMOKE_TAG" >/dev/null
+          trap 'docker rm -f verify >/dev/null 2>&1 || true' EXIT
+
+          code=000
+          for _ in $(seq 1 20); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19001/metrics || true)"
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          echo "/metrics HTTP=$code"
+          [ "$code" = "200" ] || { echo "❌ /metrics 不可用"; docker logs verify; exit 1; }
+
+          echo "探针:"
+          for p in /livez /readyz /healthz /routers; do
+            printf "  %-9s %s\n" "$p" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:19001$p")"
+          done
+
+          echo "指标抽样:"
+          curl -s http://127.0.0.1:19001/metrics | grep -E '^miwifi_(cpu_cores|exporter_router_up)' | head -4
+
+          # 自监控指标必须存在，否则「出问题也看不出来」
+          curl -s http://127.0.0.1:19001/metrics | grep -q '^miwifi_exporter_router_up' \
+            || { echo "❌ 缺少自监控指标"; exit 1; }
+
+          # 容器健康检查应当生效（不可达路由器不应让容器被判 unhealthy）
+          echo "容器健康状态: $(docker inspect -f '{{.State.Health.Status}}' verify 2>/dev/null || echo 'n/a')"
+
+      - name: summary
+        if: always() && steps.meta.outputs.tags != ''
+        run: |
+          {
+            echo "### Docker 镜像"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    name: cleanup
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+        with:
+          cleanup: true

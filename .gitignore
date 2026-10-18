@@ -8,13 +8,13 @@
 # Test binary, built with `go test -c`
 *.test
 
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
+# Coverage
+coverage.out
+coverage.html
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
-.github/
 .idea/
 bin/
 
@@ -22,3 +22,10 @@ bin/
 
 # ZCode 工具临时文件
 .zcode/
+
+# 本地配置：通常含路由器密码，不要提交
+config.local.json
+*.secret.json
+
+# ⚠️ 不要再忽略 .github/ —— CI 工作流（.github/workflows/ci.yml）必须能提交，
+# 否则镜像流水线根本不会跑。曾经有一行 `.github/` 把整个工作流目录排除了。

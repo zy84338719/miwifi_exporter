@@ -1,0 +1,36 @@
+{{- if not .Values.wifiSettings.routersConfigSecret }}
+{{- /*
+单台模式的配置。
+
+⚠️ 这里刻意**不写 routers 数组**：loadRouters 的优先级是
+ROUTERS 环境变量 > config.json 的 routers 数组 > 单台字段。
+一旦写了 routers 数组，里面的空 password 就会顶掉 env 的 ROUTER_PASSWORD，
+启动直接失败（这个坑已经踩过一次）。
+密码统一从 env ROUTER_PASSWORD 经 Secret 注入。
+
+多台请改用 routersConfigSecret：把含 routers 数组（含密码）的 config.json
+放进一个 Secret，避免明文进入 helm values 与 release 记录。
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "miwifi-exporter.fullname" . }}-config
+  labels:
+    {{- include "miwifi-exporter.labels" . | nindent 4 }}
+data:
+  config.json: |
+    {
+      "ip": {{ required "wifiSettings.routerIp 必填" .Values.wifiSettings.routerIp | quote }},
+      "host": {{ .Values.wifiSettings.routerHost | default "miwifi" | quote }},
+      "collectMode": {{ .Values.wifiSettings.collectMode | quote }},
+      "routerTimeout": {{ .Values.wifiSettings.routerTimeout | quote }},
+      "scrapeTimeout": {{ .Values.wifiSettings.scrapeTimeout | quote }},
+      "collectInterval": {{ .Values.wifiSettings.collectInterval | quote }}
+      {{- if .Values.wifiSettings.routerProfile }},
+      "profile": {{ .Values.wifiSettings.routerProfile | quote }}{{ end }}
+      {{- if .Values.wifiSettings.excludeEndpoints }},
+      "excludeEndpoints": {{ .Values.wifiSettings.excludeEndpoints | toJson }}{{ end }}
+      {{- if .Values.wifiSettings.endpointTimeouts }},
+      "endpointTimeouts": {{ .Values.wifiSettings.endpointTimeouts | toJson }}{{ end }}
+    }
+{{- end }}
