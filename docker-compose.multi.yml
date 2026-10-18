@@ -1,0 +1,56 @@
+# 多台路由器：**一个进程**同时采多台，指标用 host 标签区分。
+#
+#   docker compose -f docker-compose.multi.yml up -d
+#
+# 相比每台一个容器的好处：
+#   · 内存/进程减半（日志也只有一份，不会两台交错）
+#   · /routers 一屏看全所有路由器的 profile / 端点 / 超时次数
+#   · 抓取耗时取最慢那台而不是各台之和（各台并发采集）
+#
+# 代价（务必读）：
+#   1. **只暴露一个端口**。Prometheus 原来若配了多个 target，需合成一个，
+#      跨路由器聚合改用 by (host)：
+#          sum(mwifi_count_online)              # 总数，不变
+#          sum by (host) (miwifi_count_online)  # 按路由器分开看
+#   2. **故障域变大**：exporter 进程崩溃时两台一起中断。
+#      路由器之间仍然是隔离的（一台不可达不影响另一台的 router_up）。
+#
+# 不想把密码写进 compose 的话，用 volumes 挂一份 routers.json：
+#   volumes:
+#     - ./routers.json:/etc/miwifi/config.json:ro
+#   command: ["-config", "/etc/miwifi/config.json"]
+
+services:
+  miwifi-exporter:
+    build:
+      context: .
+      args:
+        VERSION: dev
+    image: miwifi-exporter:latest
+    container_name: miwifi-exporter
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # host 网络：exporter 直接监听宿主机 9001，少一层端口映射
+    network_mode: host
+    environment:
+      # ROUTERS 是 JSON 数组，优先级高于下面的单台字段。
+      # 每台的 host 必须唯一且不含空格/引号/反斜杠（它是指标标签）。
+      - >-
+        ROUTERS=[{"ip":"192.168.31.1:8080","password":"your-password","host":"living-room","profile":"no-scan"},
+                 {"ip":"192.168.31.99:8080","password":"your-password","host":"study","profile":"no-scan"}]
+      # - LOG_LEVEL=info
+      # - COLLECT_MODE=pull           # pull 或 poll；也可按台写在 routers 里
+      # - COLLECT_INTERVAL=30s        # poll 模式采集间隔
+      # - SCRAPE_TIMEOUT=15s
+      # - ROUTER_TIMEOUT=5s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp

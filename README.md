@@ -3,7 +3,7 @@
 小米路由器（MiWiFi）的 Prometheus exporter。
 
 [![CI](https://github.com/zy84338719/miwifi_exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/zy84338719/miwifi_exporter/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-1.17.0-orange)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.17.1-orange)](CHANGELOG.md)
 [![Go](https://img.shields.io/badge/go-1.26%2B-blue)](https://go.dev)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
@@ -145,6 +145,20 @@ ROUTERS='[{"ip":"192.168.31.1","password":"…","host":"a","profile":"no-scan"},
 
 三种写法优先级：`ROUTERS` 环境变量 > `config.json` 的 `routers` 数组 >
 旧的 `ROUTER_IP`/`ROUTER_PASSWORD`/`ROUTER_HOST` 单台写法（**完全兼容**）。
+
+**一个进程采多台**（推荐）：
+
+```bash
+docker compose -f docker-compose.multi.yml up -d
+```
+
+相比每台一个容器：内存与进程减半、日志只有一份、`/routers` 一屏看全所有路由器，
+抓取耗时取最慢那台而非各台之和。代价有两条，读之前先想清楚：
+
+1. **只暴露一个端口**。Prometheus 原来若配了多个 target 需合成一个，
+   跨路由器聚合改用 `sum by (host) (...)`（不写标签的查询不受影响）。
+2. **故障域变大**：进程崩溃时所有路由器一起中断。路由器之间仍然隔离——
+   一台不可达不会影响另一台的 `router_up`。
 
 配置文件里可以直接写时长字符串：`"routerTimeout": "8s"`。
 

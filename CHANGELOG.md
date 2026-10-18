@@ -1,5 +1,8 @@
 # Changelog
 
+> **1.17.1 是当前最新版本**（依赖升级 + 内部优化，指标零变化）。
+> 破坏性变更只在 1.17.0，见下。
+
 ---
 
 ## ⚠️ 1.17.0 含破坏性变更
@@ -30,6 +33,42 @@ v1.16.0 只有一半指标带 `host`：
 
 **怎么排查**：升级后若某条查询返回空，先确认它是不是写全了标签集；若是，
 补上 `host` 即可。指标名本身一个都没改。
+
+---
+
+## 1.17.1
+
+补丁版本：依赖升级 + 内部优化，**指标集合与取值语义零变化**，升级无需改查询。
+
+### 变更
+
+- **升级 oekit 全家桶**：`concurrency` v0.6→v0.12、`pkg` v0.11→v0.13、
+  `hertz` v0.5.10→v0.6.4、`middleware` v0.7→v0.9、`logx` v0.6→v0.7、
+  `core` v0.7→v0.8、`bootstrap` v0.6.0→v0.6.2。顺带清掉 Dependabot 报的
+  protobuf / x/sys 两个漏洞。
+- **修复 `routers[].host` 从未被校验**：`ValidateRouterHost` 只作用于单路由器的
+  `ROUTER_HOST`，而多机模式下那个字段根本不用。于是带引号/空格的 host 能一路
+  通过校验并进到 Prometheus 标签里。现在逐台校验。
+- **日志聚合同一原因去重**：路由器宕机时九个端点的错误文本完全一样，
+  拼起来单行 1.4KB、九遍重复同一句话。现在按错误归并（实测降到 493 字节），
+  逐端点详情降级到 `LOG_LEVEL=debug`。
+- **新增并发压力测试**：stok 持续剧变下的 48 路并发采集、goroutine 泄漏、
+  ctx 取消不阻塞三个场景。此前 `-race` 只在正常路径上跑过。
+
+### 内部简化（无行为变化）
+
+- `middleware` v0.8.0 起 `StackConfig.SkipPaths` 已贯通 Response，
+  `server.go` 里手搓的整条中间件栈换回标准一键栈。
+- `logx.ParseLogLevel` 改返回 `(Level, error)`，改用 `ParseLogLevelOr`
+  并在解析失败时补一条 WARN。
+- `concurrency.Flight.DoShared` 用于区分「真采集」与「复用并发结果」。
+- `core.ApplyEnvOverlay` 替掉手写的 env 覆盖合并。
+
+### 部署
+
+新增 `docker-compose.multi.yml`：**一个进程采多台**的推荐写法，
+省一半内存、日志只有一份、`/routers` 一屏看全。代价是只暴露一个端口，
+Prometheus 需合成单个 target，跨路由器聚合改用 `sum by (host)`。
 
 ---
 

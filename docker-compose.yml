@@ -1,3 +1,7 @@
+# 单台路由器的默认写法。
+#
+# 多台路由器见同目录 docker-compose.multi.yml —— 一个进程同时采多台，
+# 用 host 标签区分，比起两个容器省一半内存、日志也只有一份。
 services:
   miwifi-exporter:
     build:
@@ -14,20 +18,13 @@ services:
         max-file: "3"
     ports:
       - "9001:9001"
-    # 多台路由器：把 routers.json 挂进来即可（推荐，密码不落 env）
-    # volumes:
-    #   - ./routers.json:/etc/miwifi/config.json:ro
-    # command: ["-config", "/etc/miwifi/config.json"]
-    #
-    # 或者直接用环境变量（JSON 数组）：
-    # environment:
-    #   ROUTERS: '[{"ip":"192.168.31.1","password":"…","host":"a","profile":"no-scan"}]'
     environment:
       # ---- 必填（单台模式）----
       - ROUTER_IP=192.168.31.1
       - ROUTER_PASSWORD=your-router-password
       # ---- 常用可选 ----
-      # wifi_list 会触发 WiFi 扫描并阻塞其余端点，强烈建议 no-scan
+      # wifi_list 会触发 WiFi 扫描并阻塞整台路由器（实测 13~14s，
+      # 期间其余端点全部超时），所以默认强烈建议 no-scan。
       - ROUTER_PROFILE=no-scan
       # - ROUTER_HOST=miwifi          # host 标签取值
       # - ROUTER_PORT=9001            # exporter 自身监听端口
