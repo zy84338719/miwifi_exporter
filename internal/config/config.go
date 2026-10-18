@@ -203,11 +203,12 @@ func Load(path string) (*Config, error) {
 	// 不能直接对 cfg 调 ApplyEnv：core/config 的 ApplyEnv 只填「当前为零值」
 	// 的字段（面向 yaml → env → default 的接线顺序），而这里需要的是 env
 	// 无条件压过文件值。OverlayMerge 恰好是「src 的非零值覆盖 dst」。
-	envCfg := &Config{}
-	if err := config.ApplyEnv(envCfg); err != nil {
+	// env 压过文件。用 core/config 的 ApplyEnvOverlay（core v0.8.0 新增，
+	// 见 oekit/core#2）——它就是「空结构体上 ApplyEnv 再 OverlayMerge」这
+	// 段手写逻辑的官方封装。
+	if err := config.ApplyEnvOverlay(cfg); err != nil {
 		return nil, oerr.Wrap(err, "读取环境变量失败")
 	}
-	config.OverlayMerge(cfg, envCfg)
 
 	if err := config.FillDefaults(cfg); err != nil {
 		return nil, oerr.Wrap(err, "填充默认值失败")

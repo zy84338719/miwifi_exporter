@@ -4,13 +4,13 @@ go 1.26.0
 
 require (
 	github.com/cloudwego/hertz v0.10.6
-	github.com/oekit/bootstrap v0.6.0
-	github.com/oekit/concurrency v0.6.0
-	github.com/oekit/core v0.7.0
-	github.com/oekit/hertz v0.5.10
-	github.com/oekit/logx v0.6.0
-	github.com/oekit/middleware v0.7.0
-	github.com/oekit/pkg v0.11.0
+	github.com/oekit/bootstrap v0.6.2
+	github.com/oekit/concurrency v0.12.0
+	github.com/oekit/core v0.8.0
+	github.com/oekit/hertz v0.6.4
+	github.com/oekit/logx v0.7.0
+	github.com/oekit/middleware v0.9.0
+	github.com/oekit/pkg v0.13.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 )
@@ -29,9 +29,9 @@ require (
 	github.com/hertz-contrib/requestid v1.1.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/oekit/metrics v0.1.6 // indirect
-	github.com/oekit/registry v0.4.0 // indirect
-	github.com/oekit/tracing v0.2.1 // indirect
+	github.com/oekit/metrics v0.1.7 // indirect
+	github.com/oekit/registry v0.4.1 // indirect
+	github.com/oekit/tracing v0.2.2 // indirect
 	github.com/prometheus/common v0.72.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect

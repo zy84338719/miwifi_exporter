@@ -151,9 +151,16 @@ func (c *Collector) Self() prometheus.Collector { return c.self }
 // 注意它**不会**消费注入的请求 ctx——那是 Collect 专属的语义。
 func (c *Collector) SnapshotFor(ctx context.Context) (*router.Snapshot, error) {
 	start := time.Now()
-	snap, err := c.flight.Do(ctx, "scrape", func(cctx context.Context) (*router.Snapshot, error) {
+	// DoShared（concurrency v0.12 新增，见 oekit/concurrency#18）比 Do 多一个
+	// shared 标志，用来区分「这一轮真的去采了」和「复用了并发中的那一轮」。
+	// Prometheus 并不保证同一 target 不会并发拉取，折叠确实会发生；
+	// 没有这个标志就只能靠耗时猜测折叠有没有生效。
+	snap, shared, err := c.flight.DoShared(ctx, "scrape", func(cctx context.Context) (*router.Snapshot, error) {
 		return c.source.Collect(cctx), nil
 	})
+	if shared {
+		c.logger.Debug("复用了并发中的采集结果", "host", c.host, "mode", c.source.Mode())
+	}
 	c.self.Observe(c.source.Mode(), time.Since(start), snap)
 	return snap, err
 }

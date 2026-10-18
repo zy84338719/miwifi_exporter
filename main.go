@@ -67,11 +67,11 @@ func run() error {
 		return err
 	}
 
-	// ParseLogLevel 对无法识别的字符串返回 nil；此时退回 info，
-	// 不让一个拼错的 LOG_LEVEL 换来一个「什么都不打」的进程。
-	level := logx.LevelInfo
-	if parsed := logx.ParseLogLevel(cfg.LogLevel); parsed != nil {
-		level = *parsed
+	// 配错 LOG_LEVEL 不该换来一个「什么都不打」的进程，也没人需要为此崩溃。
+	// 用 ParseLogLevelOr：认不出来就用 info，但把问题说出来。
+	level := logx.ParseLogLevelOr(cfg.LogLevel, logx.LevelInfo)
+	if _, err := logx.ParseLogLevel(cfg.LogLevel); err != nil {
+		logx.Warn("LOG_LEVEL 无法识别，已回退到 info", "value", cfg.LogLevel, "err", err.Error())
 	}
 	logx.SetDefault(logx.NewStdLogger(server.ServiceName, level))
 

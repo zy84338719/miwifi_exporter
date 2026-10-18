@@ -22,7 +22,6 @@ import (
 	hertzmetrics "github.com/oekit/hertz/metrics"
 	"github.com/oekit/logx"
 	mw "github.com/oekit/middleware"
-	hmw "github.com/oekit/middleware/hmw"
 	oerr "github.com/oekit/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -92,22 +91,14 @@ func New(opts Options) (*server.Hertz, error) {
 
 	// 标准栈：TraceID → Recovery → Response → AccessLog。
 	//
-	// 这里没有直接用 mw.DefaultMiddleware，是因为它的 StackConfig.SkipPaths
-	// 只作用于 AccessLog，Response 仍会把响应包成 {code,data,message,trace_id}。
-	// /metrics 要是被包一层，Prometheus 立刻解析失败。ResponseMiddleware 的
-	// WithSkipPaths 才是对响应包装生效的那个开关，探针与首页一并排除。
-	// /routers 必须显式排除：它返回的是裸 JSON 数组，
-	// 被 ResponseMiddleware 包成 {code,data} 之后 curl -s | jq 就不再好用了。
+	// 这里曾手搓整条栈，只因为当时的 mw.DefaultMiddleware 把 StackConfig.SkipPaths
+	// 只喂给 AccessLog，Response 仍会把 /metrics 包成 {code,data,...} 信封。
+	// middleware v0.8.0 起 SkipPaths 已贯通 Response（见 oekit/middleware#15），
+	// 「一键标准栈」终于能直接用在带标准协议端点的服务上了。
+	//
+	// skipPaths 必须包含 /routers：它返回裸 JSON 数组，被包壳后 curl | jq 就不好用。
 	skipPaths := []string{cfg.MetricsPath, "/healthz", "/livez", "/readyz", "/routers", "/"}
-	// 注意 append(f()..., x) 不是合法 Go 语法（... 只能出现在最后一个实参），
-	// 所以这里先取回 hmw 的栈再逐个追加。
-	stack := hmw.Middleware()
-	stack = append(stack,
-		mw.RecoveryMiddleware(),
-		mw.ResponseMiddleware(mw.WithSkipPaths(skipPaths...)),
-		mw.AccessLogMiddleware(mw.WithAccessLogSkipPaths(skipPaths...)),
-	)
-	for _, m := range stack {
+	for _, m := range mw.DefaultMiddleware(mw.StackConfig{SkipPaths: skipPaths}) {
 		h.Use(m)
 	}
 
