@@ -6,6 +6,7 @@ package testutil
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -174,6 +175,22 @@ func (f *FakeRouter) SetPayload(apiPath, body string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.payloads[apiPath] = body
+}
+
+// RotateStok 模拟「路由器重启」：换一个新 stok，旧 stok 立刻失效。
+//
+// 这比 SetStok("") 更贴近真实——路由器重启后登录会返回一个**新的** stok，
+// 而不是空 stok。SetStok("") 会让登录响应里带上 ;stok=/home 这种解析不了的
+// 值，测到的是「解析失败」而不是「stok 过期后自愈」。
+func (f *FakeRouter) RotateStok() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	if _, err := fmt.Sscanf(f.ValidStok, "stok-%d", &n); err != nil {
+		n = 0
+	}
+	f.ValidStok = fmt.Sprintf("stok-%d", n+1)
+	return f.ValidStok
 }
 
 // SetStok 作废当前 stok（设为空表示所有 API 都将 403）。

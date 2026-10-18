@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	stderrors "errors"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -285,8 +286,14 @@ func (c *Client) FetchAll(ctx context.Context) *Snapshot {
 //
 // 为什么要有这一层：路由器宕机时十个端点会同时失败，逐个打 WARN 就是
 // 每轮十行。在 poll 模式下 30s 一轮，一昼夜两万行——真正需要看的那条
-// 「哪些端点挂了」反而被淹没了。故障详情用 DEBUG 级保留，需要时调
-// LOG_LEVEL=debug 即可拿到逐端点的错误。
+// 「哪些端点挂了」反而被淹没了。
+//
+// 相同错误还会被去重合并：路由器宕机时九个端点的错误文本**完全一样**，
+// 照原样拼起来单行能到 1.4KB，九遍重复同一句话。合并后形如
+//
+//	endpoints=[lan_info, status, …] reasons=[路由器返回非 2xx: … ×9]
+//
+// 去重只影响日志可读性，details 的完整逐端点信息用 DEBUG 级保留。
 func (c *Client) logSummary(ctx context.Context, snap *Snapshot, elapsed time.Duration) {
 	failed := snap.FailedEndpoints()
 	if len(failed) == 0 {
@@ -294,14 +301,31 @@ func (c *Client) logSummary(ctx context.Context, snap *Snapshot, elapsed time.Du
 		return
 	}
 
-	details := make([]string, 0, len(failed))
+	// 按错误文本归并：同一原因只说一次，并记录波及了几个端点。
+	order := make([]string, 0, len(failed))
+	byReason := make(map[string][]string, len(failed))
 	for _, name := range failed {
 		st := snap.Endpoint[name]
-		detail := name + ": " + errText(st.Err)
+		reason := errText(st.Err)
 		if st.Stale {
-			detail += "（沿用上次成功值）"
+			reason += "（沿用上次成功值）"
 		}
-		details = append(details, detail)
+		if _, seen := byReason[reason]; !seen {
+			order = append(order, reason)
+		}
+		byReason[reason] = append(byReason[reason], name)
+	}
+
+	reasons := make([]string, 0, len(order))
+	for _, reason := range order {
+		eps := byReason[reason]
+		text := reason
+		if len(eps) > 1 {
+			text += " ×" + strconv.Itoa(len(eps))
+		} else {
+			text += " [" + eps[0] + "]"
+		}
+		reasons = append(reasons, text)
 	}
 
 	c.logger.CtxWarn(ctx, "采集部分失败",
@@ -309,7 +333,14 @@ func (c *Client) logSummary(ctx context.Context, snap *Snapshot, elapsed time.Du
 		"failed", len(failed),
 		"total", len(snap.Endpoint),
 		"endpoints", failed,
-		"details", details)
+		"reasons", reasons)
+
+	// 逐端点全量详情留给 DEBUG：排查时需要，正常运行时纯属噪声。
+	for _, name := range failed {
+		st := snap.Endpoint[name]
+		c.logger.CtxDebug(ctx, "端点采集失败",
+			"endpoint", name, "err", errText(st.Err), "using_stale_value", st.Stale)
+	}
 }
 
 func errText(err error) string {
