@@ -1,7 +1,140 @@
 # Changelog
 
-> **1.18.0 是当前最新版本**。它含**破坏性变更**：一批无身份的序列不再导出，
-> 见下。1.17.0 的 `host` 标签变更仍然适用。
+> **1.19.0 是当前最新版本**。它含**破坏性变更**：一批聚合指标改为
+> 「有条件导出」，见下。1.18.0 的空标签序列清理与 1.17.0 的 `host`
+> 标签变更仍然适用。
+
+---
+
+## ⚠️ 1.19.0 含破坏性变更
+
+起因是一次真机巡检：对比 `10.10.30.71`（两台）与 `10.10.10.31`（一台）的
+`/metrics`，发现后者的 42 个指标族里有 **9 个族一条序列都没有**，
+另外几个族被稳定导出成 **0**——而那些 0 与「真的没有」完全无法分辨。
+
+### 假零：端点不可用时不再导出 0
+
+`router.Snapshot.Usable()` 统一了判定：**端点被 profile 跳过、或本轮失败
+且没有陈旧值可沿用时，它的下游指标一条都不发**。
+
+真机（10.10.10.31，采 R3P @10.10.10.249）上受影响的：
+
+| 指标 | 来源端点 | 修复前 | 修复后 |
+|---|---|---|---|
+| `wifi_sta_count`（3 条 band） | `newstatus` | 恒 `0` | 不导出 |
+| `mesh_cap_count` / `mesh_re_count` | `newstatus` | 恒 `0` | 不导出 |
+| `device_wifi_quality` | `device_list` | 恒 `0` | 不导出 |
+| `device_connection_type` / `device_pcontrol` | `device_list` | 恒 `0` | 不导出 |
+| `neighbor_wifi_count` | `wifi_list` | 恒 `0` | 不导出 |
+| `lan_port_link` / `lan_uptime` | `lan_info` | 恒 `0` | 不导出 |
+| `wan_link_status` / `wan_negotiation_speed` / `wan_info` | `pppoe_status` | 恒 `0` / 空 | 不导出 |
+
+**为什么是破坏性的**：跨台对比面板里，`sum(miwifi_wifi_sta_count)` 之类的
+聚合查询会突然少掉一台机器的贡献，且不留任何痕迹。
+
+**怎么区分「真的没有」和「没采到」**：用
+`miwifi_exporter_endpoint_supported{endpoint="…"}`，值为 0 就是没采到。
+
+**什么没变**：端点失败但有上次成功值时（`endpoint_stale=1`）**仍然导出**，
+陈旧值好过让 `rate()` 断档，行为与 1.18.0 一致。
+
+### `count_*_without_mash` 不再谎报 0
+
+`Status.Count` 的两个 `*_without_mash` 字段从 `int` 改成 `*int`。
+
+实测 R3P（固件 2.16.29）的 `/api/misystem/status` **只带 `all` 与 `online`**，
+没有这两个字段。写成 `int` 的话 encoding/json 会把它们留成零值并原样导出，
+于是同一台机器上同时出现：
+
+```
+miwifi_count_all{host="Home-GFW"}              104
+miwifi_count_all_without_mash{host="Home-GFW"}  0   ← 固件压根没报这个字段
+```
+
+后者会被读成「除 Mesh 外 0 台设备」，与前者直接矛盾，且没有任何办法从指标
+本身分辨真假。现在字段缺失就不发序列。
+
+### `wan_info` 推翻 1.18.0 的「刻意不动」
+
+1.18.0 把 `wan_info{wan_ip="",gateway="",dns=""}` 归入「聚合指标恒定存在」
+并明确保留，理由是「`wan_link_status` 已完整表达 WAN 通断」。**这个理由
+本身站不住**：空地址的 `wan_info` 与同一版本删掉的 `ipv4{ipv4=""}` 是同一类
+空占位记录。现在地址/网关/DNS 全空时不再导出。
+
+「WAN 没连」这个事实没有因此丢失——它由 `wan_link_status=0` 表达，
+`wan_info` 本就不该承担这个语义。
+
+### 新增：重复失败降级
+
+停问端点的依据从「只有 404/501」扩展到两条：
+
+1. HTTP 404 / 501——一次就确定。
+2. **连续 5 轮吐出逐字相同的非超时错误**——`profile.RepeatedFailureThreshold`。
+
+第 2 条来自一次真机排查：`10.10.10.31` 上 `pppoe_status` 反复失败但不是 404，
+自适应探测永远不收敛，`scrape_total{result="partial"}` 只增不减（实测 10 次
+采集 0 次 success），而 `endpoint_supported` 始终说 1。
+
+**判据是错误文本完全相同，不是失败次数**——这是安全阀。超时与
+**熔断打开**都被显式排除：wifi_list 触发 WiFi 扫描会阻塞整机并打开熔断，
+随后九个健康端点轮流拿到逐字相同的 `circuit breaker is open`，不排除的话
+扫描一次就会把整台路由器的端点全部停问（`RecordResult` 注释里警告的那场事故，
+换了个入口重来一遍）。
+
+被停问的端点仍按 30 分钟复探，固件升级后新长出来的接口不会被永久忘掉。
+
+### 新增：`/routers` 暴露 `endpointErrors`
+
+```bash
+curl -s http://10.10.10.31:9001/routers | jq '.[] | {host, endpointErrors}'
+```
+
+指标能告诉你「哪个端点挂了」，但说不出**为什么挂**——而失败原因此前只出现在
+容器日志里，排查的人却未必有那台机器的 ssh。挂到 HTTP 上之后一条 curl 就能拿到。
+
+### 修复：配置里的 `excludeEndpoints` 会在 30 分钟后被静默撤销
+
+这是本次真机部署时才暴露出来的 bug，也是本次排查里**最隐蔽的一个**。
+
+R3P 的 compose 里明明写着：
+
+```json
+{"ip":"10.10.10.249","host":"Home-GFW","profile":"no-scan","excludeEndpoints":["pppoe_status"]}
+```
+
+启动日志也确实打了「按配置排除端点 endpoints=[pppoe_status]」，
+`/routers` 第一次也显示它已被跳过。**一切看上去都对。**
+
+但 4.5 小时后的容器日志里：
+
+```
+[INFO] 重新探测此前判定为不存在的端点 endpoints=[device_list newstatus pppoe_status]
+[WARN] pppoe_status … status=500 body=Internal Server Error
+```
+
+**根因**：`Disable()` 有两种来源，却共用同一份状态——
+
+- 探测判定「这台固件没有这个接口」→ 应该复探（固件升级后接口可能回来）
+- 配置显式排除 → **是用户的明确意志，不该被任何自动机制推翻**
+
+`RecheckDue()` 无差别地把两者一起放回探测名单。于是配置排除在 30 分钟后
+失效，`pppoe_status` 重新开始每轮报错，`scrape_total{result="partial"}`
+只增不减——而配置文件里那行字从头到尾没变过，**配置形同虚设且毫无提示**。
+
+**修复**：新增 `Instance.Pin()`，`RetryDisabled` 跳过被钉死的端点。
+配置排除经由 `router.New` 的 `ExcludeEndpoints` 走 `Pin`，永久生效；
+探测结论仍走 `Disable`，保留 30 分钟复探。解除钉死只需重启进程。
+
+### 顺带确认：真实错误是 500，不是 404
+
+```
+status=500 body=Internal Server Error
+```
+
+`pppoe_status` 在这台 R3P 上是 500，而 `device_list` / `newstatus` 才是 404。
+上面那条「连续 5 轮相同错误降级」正好命中——错误文本逐字相同
+（`路由器返回非 2xx: … status=500 body=Internal Server Error [pppoe_status]`），
+第 5 轮自动停问。两条机制叠加，这个端点现在无论如何都收敛了。
 
 ---
 

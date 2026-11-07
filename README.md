@@ -205,11 +205,45 @@ profile 会让它们**导出的指标不一样**，更糟的是真机验证时�
 
 `/routers` 端点的 `schemaAligned` 字段逐台标出。**建议所有路由器用同一个 profile。**
 
+### 自适应降级：什么时候停问一个端点
+
+停问的依据只有两条，都是**确定性**信号：
+
+1. **HTTP 404 / 501**——固件压根没有这个接口，一次就确定。
+2. **连续 5 轮吐出逐字相同的非超时错误**（`profile.RepeatedFailureThreshold`）。
+
+第 2 条来自一次真机排查：一台 R3P 上 `pppoe_status` 反复失败但不是 404，
+自适应探测因此永远不收敛，结果 `scrape_total{result="partial"}` 只增不减，
+一次干净的 `success` 都不会出现，而 `endpoint_supported` 始终说 1。
+
+判据是**错误文本完全相同**而不是「失败次数」，这一点是安全阀。超时与
+**熔断打开**都被显式排除：wifi_list 触发 WiFi 扫描时会阻塞整机并打开熔断，
+随后九个本来健康的端点轮流拿到逐字相同的 `circuit breaker is open`——
+不排除的话，扫描一次就会把整台路由器的端点全部停问。
+
+被停问的端点仍会按 30 分钟复探，固件升级后新长出来的接口不会被永久忘掉。
+要立刻停问，用 `EXCLUDE_ENDPOINTS` 显式排除。
+
+> **配置排除不会被复探撤销。** `EXCLUDE_ENDPOINTS` / `routers[].excludeEndpoints`
+> 走的是「钉死」通道，与上面的探测结论是两条独立路径。
+> 1.18.0 之前两者混在一起，导致配置排除在启动 30 分钟后被复探静默撤销——
+> 配置里那行字看着一直生效，端点却已被放回探测名单并开始每轮报错。
+> 需要让被排除的端点恢复时，重启进程即可。
+
+### 排障：先看 `/routers` 的 `endpointErrors`
+
+指标能告诉你 `endpoint_up{endpoint="pppoe_status"} 0`，但说不出**为什么**。
+从 **1.19.0** 起，失败原因会挂到 `/routers` 上，不用 ssh 进那台机器：
+
+```bash
+curl -s http://10.10.10.31:9001/routers | jq '.[] | {host, endpointErrors}'
+```
+
 ### 聚合指标恒定存在
 
 跨台对比面板默认引用**聚合类**指标（cpu/memory/count/uptime/wan_\*/mesh_\*…）。
-这类每台必定导出，取不到就发 0，绝不因为某台没数据就整条消失。
-`wan_negotiation_speed` 就是因此修的（实测两台里有一台没上报该字段）。
+这类**只要来源端点可用**就必定导出，取不到就发 0，绝不因为某台没数据就
+整条消失。`wan_negotiation_speed` 就是因此修的（实测两台里有一台没上报该字段）。
 
 **按实体**的指标（`ipv4` / `ipv4_mask` / `ipv6` / `device_*` / `wifi_detail` /
 `lan_port_link` / `neighbor_wifi_rssi` / `wifi_device_signal`）不在此列：每个实体一条序列，
@@ -223,9 +257,28 @@ profile 会让它们**导出的指标不一样**，更糟的是真机验证时�
 > 有身份但字段缺失的设备**仍然导出**：MAC 有效而查不到 IP 时 `ip=""`，
 > 意思是「IP 未知」，不是「这台机器不存在」。按设备维度查询请用
 > `mac` 或 `device_name` 匹配。
->
-> 例外是 `wan_info`：它虽可能出现空标签，但已被归入上面的「聚合指标恒定存在」，
-> 且 `wan_link_status{host}` 完整表达了 WAN 通断，刻意保持原样。
+
+#### 聚合指标也会「有条件不导出」
+
+从 **1.19.0** 起，「来源端点可用」这个前提本身也可能不成立。以下情况
+**不发序列**而不是发 0——发 0 会产生一个与真实值无法区分的谎报：
+
+| 指标 | 不导出的条件 | 发 0 会被读成 |
+|---|---|---|
+| `count_all_without_mash`<br>`count_online_without_mash` | 固件 status 不带这两个字段（实测 R3P） | 「除 Mesh 外 0 台设备」，与 `count_all=104` 自相矛盾 |
+| `wifi_sta_count`<br>`mesh_cap_count` / `mesh_re_count` | `newstatus` 端点被 profile 跳过（实测 R3P） | 「三个频段都没人连、这台不是 Mesh 节点」 |
+| `device_wifi_quality`<br>`device_connection_type` / `device_pcontrol` | `device_list` 端点被 profile 跳过（实测 R3P） | 「这些终端都没有 WiFi 信号和连接类型」 |
+| `neighbor_wifi_count` | `wifi_list` 被跳过（`no-scan` profile 默认如此） | 「扫过周边 WiFi，发现 0 个邻居」 |
+| `lan_port_link` / `lan_uptime` | `lan_info` 端点不可用 | 「所有网口都没插线」 |
+| `wan_link_status` / `wan_negotiation_speed`<br>`wan_info` | `pppoe_status` 端点不可用 | 「WAN 断了」 |
+
+> `wan_info` 在 **1.18.0** 曾被刻意保留为「恒定存在」，1.19.0 推翻了这条：
+> 地址/网关/DNS 全空时它同样是固件回的空占位记录，与被同一版本删掉的
+> `ipv4{ipv4=""}` 是同一类东西。**「WAN 没连」由 `wan_link_status=0` 表达**，
+> `wan_info` 本就不该承担这个语义。
+
+需要区分「真的没有」和「没采到」时，用
+`miwifi_exporter_endpoint_supported{endpoint="…"}`：值为 0 就是没采到。
 
 ---
 
