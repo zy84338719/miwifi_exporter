@@ -26,10 +26,22 @@ type Status struct {
 	} `json:"mem"`
 	Temperature int `json:"temperature"`
 	Count       struct {
-		All               int `json:"all"`
-		Online            int `json:"online"`
-		AllWithoutMash    int `json:"all_without_mash"`
-		OnlineWithoutMash int `json:"online_without_mash"`
+		All    int `json:"all"`
+		Online int `json:"online"`
+		// AllWithoutMash / OnlineWithoutMash 用指针而不是 int。
+		//
+		// 实测 R3P（固件 2.16.29）的 /api/misystem/status 只上报 all 与
+		// online，压根不带这两个 *_without_mash 字段。写成 int 的话，
+		// encoding/json 会把它们留成零值 0 并原样导出，于是同一台机器上
+		// 同时出现 count_all=104 与 count_all_without_mash=0——
+		// 后者会被读成「除 Mesh 外 0 台设备」，与前者直接矛盾，而且
+		// 没有任何办法从指标本身分辨它到底是「真的是 0」还是「固件没报」。
+		// 指针区分这两种情况：nil = 固件未上报，导出层据此跳过该序列。
+		//
+		// 代价是调用处要做一次 nil 判断，这正是「缺一条序列」与
+		// 「谎报一个 0」之间的正确取舍。
+		AllWithoutMash    *int `json:"all_without_mash"`
+		OnlineWithoutMash *int `json:"online_without_mash"`
 	} `json:"count"`
 	Hardware struct {
 		Mac      string `json:"mac"`

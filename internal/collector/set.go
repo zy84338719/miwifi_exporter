@@ -308,6 +308,14 @@ type RouterStatus struct {
 	Endpoints []string `json:"enabledEndpoints"`
 	Disabled  []string `json:"disabledEndpoints"`
 	Timeouts  int64    `json:"timeouts"`
+	// EndpointErrors 是「端点名 → 最近一次失败原因」，只含本轮失败的端点。
+	//
+	// 为什么必须挂在 HTTP 上而不只留在日志里：指标能告诉你
+	// endpoint_up{endpoint="pppoe_status"} 0，但说不出为什么。真实案例是
+	// 一台 R3P 上 pppoe_status 反复失败、scrape_total 永远只有 partial，
+	// 而原因只出现在容器日志里——排查的人却未必有那台机器的 ssh。
+	// 一条 curl 拿到错误文本，比翻日志快一个数量级。
+	EndpointErrors map[string]string `json:"endpointErrors,omitempty"`
 	// Schema 标记这台导出的端点集合是否与其余各台一致，见 SchemaDivergence。
 	SchemaAligned bool `json:"schemaAligned"`
 }
@@ -441,15 +449,16 @@ func (s *Set) Status() []RouterStatus {
 	out := make([]RouterStatus, 0, len(s.instances))
 	for _, inst := range s.instances {
 		st := RouterStatus{
-			Host:          inst.Spec.Host,
-			IP:            inst.Spec.IP,
-			Profile:       inst.Client.Profile().Name(),
-			Mode:          inst.Source.Mode(),
-			Ready:         true,
-			Endpoints:     inst.Client.Profile().EnabledEndpoints(),
-			Disabled:      inst.Client.Profile().DisabledEndpoints(),
-			Timeouts:      inst.Client.Profile().TotalTimeouts(),
-			SchemaAligned: s.schemaAligned(inst.Spec.Host),
+			Host:           inst.Spec.Host,
+			IP:             inst.Spec.IP,
+			Profile:        inst.Client.Profile().Name(),
+			Mode:           inst.Source.Mode(),
+			Ready:          true,
+			Endpoints:      inst.Client.Profile().EnabledEndpoints(),
+			Disabled:       inst.Client.Profile().DisabledEndpoints(),
+			Timeouts:       inst.Client.Profile().TotalTimeouts(),
+			EndpointErrors: inst.Client.LastErrors(),
+			SchemaAligned:  s.schemaAligned(inst.Spec.Host),
 		}
 		if inst.poller != nil {
 			st.Ready = inst.poller.Ready()

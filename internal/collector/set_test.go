@@ -380,25 +380,48 @@ func TestExcludeOneRouterDetected(t *testing.T) {
 	}
 }
 
-// aggregateMetrics 是**聚合类**指标：每台路由器都必定导出，与有没有设备、
-// 有几个地址无关。它们是多台对比的基础，面板默认会直接引用。
+// aggregateMetrics 是**聚合类**指标：只要其来源端点可用，每台路由器都必定
+// 导出，与有没有设备、有几个地址无关。它们是多台对比的基础，面板默认会
+// 直接引用。
 //
 // 「按实体」的指标（ipv4 / device_* / wifi_detail / lan_port_link /
 // neighbor_wifi_rssi / wifi_device_signal）**不在此列**：它们是每个实体一条
 // 序列，没有实体就没有序列，这是 Prometheus 的固有语义，不是 bug。
+//
+// 「有条件导出」的聚合类指标见 conditionalAggregates：它们各自有一条
+// 「拿不到就不发」的规则，硬发 0 会撒谎，因此不满足「恒定存在」。
 var aggregateMetrics = []string{
 	"miwifi_cpu_cores", "miwifi_cpu_mhz", "miwifi_cpu_load",
 	"miwifi_memory_total_mb", "miwifi_memory_usage_mb", "miwifi_memory_usage",
 	"miwifi_count_all", "miwifi_count_online",
-	"miwifi_count_all_without_mash", "miwifi_count_online_without_mash",
 	"miwifi_uptime",
 	"miwifi_platform", "miwifi_version", "miwifi_sn", "miwifi_mac",
 	"miwifi_wan_upload_speed", "miwifi_wan_download_speed",
 	"miwifi_wan_upload_traffic", "miwifi_wan_download_traffic",
-	"miwifi_wan_link_status", "miwifi_wan_negotiation_speed", "miwifi_wan_info",
+	"miwifi_wan_link_status", "miwifi_wan_negotiation_speed",
 	"miwifi_lan_uptime",
 	"miwifi_wifi_sta_count", "miwifi_mesh_cap_count", "miwifi_mesh_re_count",
-	"miwifi_neighbor_wifi_count",
+}
+
+// conditionalAggregates 是**有条件导出**的聚合类指标 → 其判定依据的说明。
+//
+// 这三条都不是「忘了实现」，而是固件层面确实拿不到，硬发 0 会产生一个
+// 与真实值无法区分的谎报。实测依据在真机上跑出来的：
+//
+//	count_*_without_mash  R3P（2.16.29）的 status 不带这两个字段。
+//	                      发 0 会与 count_all=104 自相矛盾，
+//	                      被读成「除 Mesh 外 0 台设备」。
+//	wan_info              地址/网关/DNS 全空是固件回的占位记录，
+//	                      发出去会稳定占住一条 miwifi_wan_info{wan_ip=""}
+//	                      序列，被误读成「有一台地址为空的 WAN」。
+//	                      「WAN 没连」这个事实由 wan_link_status=0 表达。
+//	neighbor_wifi_count   来源端点 wifi_list 在 no-scan 下被跳过，
+//	                      发 0 会被读成「扫过周边 WiFi，发现 0 个邻居」。
+var conditionalAggregates = map[string]string{
+	"miwifi_count_all_without_mash":    "固件 status 不带 all_without_mash 字段",
+	"miwifi_count_online_without_mash": "固件 status 不带 online_without_mash 字段",
+	"miwifi_wan_info":                  "pppoe_status 未上报任何地址/网关/DNS",
+	"miwifi_neighbor_wifi_count":       "wifi_list 端点被 profile 跳过",
 }
 
 // TestAggregateMetricsPresentForEveryRouter 守住「不同路由器抓到的信息一样」。
@@ -424,12 +447,75 @@ func TestAggregateMetricsPresentForEveryRouter(t *testing.T) {
 	t.Cleanup(func() { _ = set.Close(context.Background()) })
 
 	fams := gatherSet(t, set)
+
+	// 无条件聚合指标：两台都必须存在。
 	for _, host := range []string{"full", "empty"} {
 		for _, name := range aggregateMetrics {
 			if _, ok := lookup(t, fams, name, map[string]string{"host": host}); !ok {
-				t.Errorf("%s 缺少聚合指标 %s——聚合类指标必须每台都存在（取不到就发 0）", host, name)
+				t.Errorf("%s 缺少聚合指标 %s——来源端点可用时它必须每台都存在", host, name)
 			}
 		}
+	}
+
+	// 有条件聚合指标，full 这台固件上报了对应字段，必须存在。
+	for name, why := range conditionalAggregates {
+		if name == "miwifi_neighbor_wifi_count" {
+			continue // no-scan 下 wifi_list 被跳过，由 TestSkippedEndpointEmitsNoFakeZero 单独断言
+		}
+		if _, ok := lookup(t, fams, name, map[string]string{"host": "full"}); !ok {
+			t.Errorf("full 缺少 %s——固件上报了对应字段（%s）却没导出", name, why)
+		}
+	}
+
+	// empty 这台每个端点都只回 {"code":0}，三条必须一条都不出现。
+	for name, why := range conditionalAggregates {
+		if name == "miwifi_neighbor_wifi_count" {
+			continue
+		}
+		if _, ok := lookup(t, fams, name, map[string]string{"host": "empty"}); ok {
+			t.Errorf("empty 仍导出了 %s——%s，此时发 0 等于谎报", name, why)
+		}
+	}
+}
+
+// TestSkippedEndpointEmitsNoFakeZero 钉住「端点被跳过时不得导出恒 0 指标」。
+//
+// 真机来源：R3P 上 newstatus 与 device_list 被自适应探测判为「本固件没有」
+// 并跳过，于是 wifi_sta_count、mesh_cap_count、mesh_re_count、
+// device_wifi_quality、device_connection_type、device_pcontrol
+// 六个指标被稳定导出成 0，与「真的没设备 / 真的不是 Mesh 节点」无法分辨。
+// 拿它们做告警必然误报。
+//
+// 这里用 no-scan 跳过 wifi_list 复现同一形态：neighbor_wifi_count 必须消失。
+func TestSkippedEndpointEmitsNoFakeZero(t *testing.T) {
+	fake := testutil.NewFakeRouter(t)
+	spec := newSpec(t, fake, "noscan", 5*time.Second)
+	if spec.Profile != profile.NoScan {
+		t.Fatalf("前置条件不成立：本测试依赖 no-scan profile，实际 %q", spec.Profile)
+	}
+
+	set, err := collector.NewSet([]collector.RouterSpec{spec},
+		collector.SetOptions{Namespace: "miwifi", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewSet 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close(context.Background()) })
+
+	fams := gatherSet(t, set)
+
+	// 被跳过的端点派生的两条：一个恒 0、一个按实体。
+	if _, ok := lookup(t, fams, "miwifi_neighbor_wifi_count", map[string]string{"host": "noscan"}); ok {
+		t.Error("wifi_list 已被 no-scan 跳过，却仍导出了 neighbor_wifi_count=0——" +
+			"这会被读成「扫过周边 WiFi，发现 0 个邻居」")
+	}
+	if _, ok := lookup(t, fams, "miwifi_neighbor_wifi_rssi", map[string]string{"host": "noscan"}); ok {
+		t.Error("wifi_list 已被 no-scan 跳过，却仍导出了 neighbor_wifi_rssi")
+	}
+
+	// 但 endpoint_supported 必须如实说 0，否则告警无从区分「跳过」与「真没有」。
+	if v, ok := lookup(t, fams, "miwifi_exporter_endpoint_supported",
+		map[string]string{"host": "noscan", "endpoint": profile.EPWifiList}); !ok || v != 0 {
+		t.Errorf("endpoint_supported{wifi_list} = %v（存在=%v），期望 0", v, ok)
 	}
 }
 
@@ -548,5 +634,101 @@ func TestAllSelfMetricLabelSetsConsistent(t *testing.T) {
 					host, name, host)
 			}
 		}
+	}
+}
+
+// TestUnreportedCountFieldsNotExported 钉住「固件没上报的字段不发序列」。
+//
+// 真机来源：R3P（固件 2.16.29）的 /api/misystem/status 只带 all 与 online，
+// 压根没有 *_without_mash 这两个字段。写成 int 的话它们会被留成零值 0 并
+// 导出，于是同一台机器上同时出现 count_all=104 与 count_all_without_mash=0，
+// 后者被读成「除 Mesh 外 0 台设备」，与前者直接矛盾，且无从分辨真假。
+func TestUnreportedCountFieldsNotExported(t *testing.T) {
+	fake := testutil.NewFakeRouter(t)
+	fake.SetPayload("api/misystem/status", `{
+		"code": 0,
+		"count": {"all": 104, "online": 0},
+		"hardware": {"mac": "28:6C:07:6F:03:AD", "platform": "R3P", "version": "2.16.29", "sn": "15796/10009119"},
+		"mem": {"usage": 0.17, "total": "512MB"},
+		"cpu": {"core": 4, "hz": "880MHz", "load": 0.0035}
+	}`)
+
+	set, err := collector.NewSet([]collector.RouterSpec{newSpec(t, fake, "r3p", 5*time.Second)},
+		collector.SetOptions{Namespace: "miwifi", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewSet 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close(context.Background()) })
+
+	fams := gatherSet(t, set)
+
+	// 固件上报了的照常导出。
+	if v, ok := lookup(t, fams, "miwifi_count_all", map[string]string{"host": "r3p"}); !ok || v != 104 {
+		t.Errorf("count_all = %v（存在=%v），期望 104", v, ok)
+	}
+	if v, ok := lookup(t, fams, "miwifi_count_online", map[string]string{"host": "r3p"}); !ok || v != 0 {
+		t.Errorf("count_online = %v（存在=%v），期望 0", v, ok)
+	}
+
+	// 没上报的必须一条都不出现——发 0 就是谎报。
+	for _, name := range []string{"miwifi_count_all_without_mash", "miwifi_count_online_without_mash"} {
+		if _, ok := lookup(t, fams, name, map[string]string{"host": "r3p"}); ok {
+			t.Errorf("%s 仍被导出：固件没带这两个字段，发 0 会被读成「真的是 0 台」", name)
+		}
+	}
+}
+
+// TestEmptyPppoeInfoNotExported 钉住「空地址的 wan_info 不占序列」。
+//
+// 一台跑 AP/中继模式的路由器没有自己的 WAN，pppoe_status 会如实回一个
+// 地址、网关、DNS 全空的占位记录。照单全收就会稳定占住一条
+// miwifi_wan_info{wan_ip="",gateway="",dns=""} 序列，被误读成
+// 「有一台地址为空的 WAN」。
+//
+// 「WAN 没连」这个事实并没有因此丢失：它由 wan_link_status 表达。
+func TestEmptyPppoeInfoNotExported(t *testing.T) {
+	fake := testutil.NewFakeRouter(t)
+	fake.SetPayload("api/xqnetwork/pppoe_status", `{"code": 0}`)
+
+	set, err := collector.NewSet([]collector.RouterSpec{newSpec(t, fake, "apmode", 5*time.Second)},
+		collector.SetOptions{Namespace: "miwifi", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewSet 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close(context.Background()) })
+
+	fams := gatherSet(t, set)
+
+	if _, ok := lookup(t, fams, "miwifi_wan_info", map[string]string{"host": "apmode"}); ok {
+		t.Error("地址/网关/DNS 全空时仍导出了 wan_info——这是固件回的占位记录，不是实体")
+	}
+	// 链路状态仍然要说：0 表示「没有链路」，这是真实状态而不是占位记录。
+	if v, ok := lookup(t, fams, "miwifi_wan_link_status", map[string]string{"host": "apmode"}); !ok || v != 0 {
+		t.Errorf("wan_link_status = %v（存在=%v），期望 0", v, ok)
+	}
+}
+
+// TestRouterStatusExposesEndpointErrors 验证失败原因能被 /routers 读到。
+func TestRouterStatusExposesEndpointErrors(t *testing.T) {
+	fake := testutil.NewFakeRouter(t)
+	fake.SetFail("api/xqnetwork/pppoe_status", true)
+
+	set, err := collector.NewSet([]collector.RouterSpec{newSpec(t, fake, "diag", 5*time.Second)},
+		collector.SetOptions{Namespace: "miwifi", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewSet 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = set.Close(context.Background()) })
+
+	// 先采一轮，Client 才有「最近一轮」的失败记录。
+	gatherSet(t, set)
+
+	statuses := set.Status()
+	if len(statuses) != 1 {
+		t.Fatalf("Status 应返回 1 条，实际 %d", len(statuses))
+	}
+	text, ok := statuses[0].EndpointErrors["pppoe_status"]
+	if !ok || text == "" {
+		t.Fatalf("/routers 应带上 pppoe_status 的失败原因，实际 %v", statuses[0].EndpointErrors)
 	}
 }

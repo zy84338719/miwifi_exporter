@@ -226,6 +226,12 @@ func (c *Collector) emit(ch chan<- prometheus.Metric, snap *router.Snapshot) {
 
 // emitSystem 输出 CPU / 内存 / 终端计数 / 运行时长 / 硬件标识。
 func (c *Collector) emitSystem(ch chan<- prometheus.Metric, s *router.Snapshot) {
+	// 整机指标的下游只有 status 一个端点。它没采到时下面这些字段全是零值，
+	// 与「这台路由器各项指标真的是 0」在监控上完全无法分辨，不导出。
+	if !s.Usable(profile.EPStatus) {
+		return
+	}
+
 	st := &s.Status
 	host := c.host
 
@@ -242,8 +248,13 @@ func (c *Collector) emitSystem(ch chan<- prometheus.Metric, s *router.Snapshot) 
 
 	emit(ch, c.d.countAll, float64(st.Count.All), host)
 	emit(ch, c.d.countOnline, float64(st.Count.Online), host)
-	emit(ch, c.d.countAllWithoutMash, float64(st.Count.AllWithoutMash), host)
-	emit(ch, c.d.countOnlineWithoutMash, float64(st.Count.OnlineWithoutMash), host)
+	// nil 表示固件压根没上报这两个字段（实测 R3P 如此），此时发 0 就是谎报。
+	if st.Count.AllWithoutMash != nil {
+		emit(ch, c.d.countAllWithoutMash, float64(*st.Count.AllWithoutMash), host)
+	}
+	if st.Count.OnlineWithoutMash != nil {
+		emit(ch, c.d.countOnlineWithoutMash, float64(*st.Count.OnlineWithoutMash), host)
+	}
 
 	emit(ch, c.d.uptime, parseFloat(st.UpTime), host)
 
@@ -254,15 +265,71 @@ func (c *Collector) emitSystem(ch chan<- prometheus.Metric, s *router.Snapshot) 
 }
 
 // emitWAN 输出 WAN 速率、流量、地址与 PPPoE/LAN 状态。
+//
+// 这一组指标来自四个互不相干的端点，逐段按来源门控：
+//
+//	status.Wan        → wan_{up,down}load_{speed,traffic}
+//	wan_info          → ipv4 / ipv4_mask / ipv6
+//	pppoe_status      → wan_link_status / wan_negotiation_speed / wan_info
+//	lan_info          → lan_port_link / lan_uptime
+//
+// 混在一起「一次性全发」的问题很实际：实测 R3P 不提供 pppoe_status，
+// 那时 wan_link_status 会稳定导出 0、wan_info 导出一条全空地址的序列，
+// 而这两者看上去与「WAN 真的断了」没有任何区别。
 func (c *Collector) emitWAN(ch chan<- prometheus.Metric, s *router.Snapshot) {
 	host := c.host
-	wan := &s.Status.Wan
 
-	emit(ch, c.d.wanUploadSpeed, parseFloat(wan.UpSpeed), host)
-	emit(ch, c.d.wanDownloadSpeed, parseFloat(wan.DownSpeed), host)
-	emit(ch, c.d.wanUploadTraffic, parseFloat(wan.Upload), host)
-	emit(ch, c.d.wanDownTraffic, parseFloat(wan.Download), host)
+	if s.Usable(profile.EPStatus) {
+		wan := &s.Status.Wan
+		emit(ch, c.d.wanUploadSpeed, parseFloat(wan.UpSpeed), host)
+		emit(ch, c.d.wanDownloadSpeed, parseFloat(wan.DownSpeed), host)
+		emit(ch, c.d.wanUploadTraffic, parseFloat(wan.Upload), host)
+		emit(ch, c.d.wanDownTraffic, parseFloat(wan.Download), host)
+	}
 
+	if s.Usable(profile.EPWanInfo) {
+		c.emitWANAddresses(ch, s, host)
+	}
+
+	if s.Usable(profile.EPPppoeStatus) {
+		emit(ch, c.d.wanLinkStatus, float64(s.PppoeStatus.Status), host)
+		// 协商速率解析不出来时发 0，而不是不发这一条。
+		//
+		// 两种行为在单台场景下都讲得通，但多台场景下必须选一个：不发的话，
+		// 同一台 exporter 里「上报了协商速率的路由器」有这条序列、「没上报的」
+		// 完全没有，跨路由器对比时会出现一条有、一条没有的空洞。
+		// 发 0 至少保证指标集合一致，语义写在 HELP 里：0 = 路由器未上报。
+		speed, err := strconv.ParseFloat(s.PppoeStatus.WanSpeed, 64)
+		if err != nil {
+			speed = 0
+		}
+		emit(ch, c.d.wanNegSpeed, speed, host)
+
+		// wan_info 是按「实体」建模的：地址、网关、DNS 三者全空时它不是
+		// 一条 WAN 连接，而是固件回的一个占位记录。照单全收会稳定占住
+		// 一条 miwifi_wan_info{wan_ip="",gateway="",dns=""} 序列，
+		// 被误读成「有一台地址为空的 WAN」。
+		//
+		// 空地址的「WAN 没连」这个事实没有因此丢失：它由
+		// wan_link_status=0 表达，而 wan_info 本来就不该用来表达它。
+		ip := strings.TrimSpace(s.PppoeStatus.IP.Address)
+		gw := strings.TrimSpace(s.PppoeStatus.GW)
+		dns := strings.Join(s.PppoeStatus.DNS, ",")
+		if ip != "" || gw != "" || strings.TrimSpace(dns) != "" {
+			emit(ch, c.d.wanInfo, 1, host, s.PppoeStatus.IP.Address, s.PppoeStatus.GW, dns)
+		}
+	}
+
+	if s.Usable(profile.EPLanInfo) {
+		for i, link := range s.LanInfo.LinkList {
+			emit(ch, c.d.lanPortLink, float64(link), host, strconv.Itoa(i))
+		}
+		emit(ch, c.d.lanUptime, float64(s.LanInfo.Info.Uptime), host)
+	}
+}
+
+// emitWANAddresses 输出 WAN 的 IPv4/IPv6 地址与掩码。
+func (c *Collector) emitWANAddresses(ch chan<- prometheus.Metric, s *router.Snapshot, host string) {
 	// WAN 地址按实体建模：每个地址一条序列，没有实体就没有序列。
 	//
 	// 部分固件在 WAN 未连接（或用了别的接入方式）时会返回一条 ip/mask
@@ -301,28 +368,18 @@ func (c *Collector) emitWAN(ch chan<- prometheus.Metric, s *router.Snapshot) {
 		}
 		emit(ch, c.d.ipv6, 1, host, ipv6)
 	}
-
-	emit(ch, c.d.wanLinkStatus, float64(s.PppoeStatus.Status), host)
-	// 协商速率解析不出来时发 0，而不是不发这一条。
-	//
-	// 两种行为在单台场景下都讲得通，但多台场景下必须选一个：不发的话，
-	// 同一台 exporter 里「上报了协商速率的路由器」有这条序列、「没上报的」
-	// 完全没有，跨路由器对比时会出现一条有、一条没有的空洞。
-	// 发 0 至少保证指标集合一致，语义写在 HELP 里：0 = 路由器未上报。
-	speed, err := strconv.ParseFloat(s.PppoeStatus.WanSpeed, 64)
-	if err != nil {
-		speed = 0
-	}
-	emit(ch, c.d.wanNegSpeed, speed, host)
-	emit(ch, c.d.wanInfo, 1, host, s.PppoeStatus.IP.Address, s.PppoeStatus.GW, strings.Join(s.PppoeStatus.DNS, ","))
-
-	for i, link := range s.LanInfo.LinkList {
-		emit(ch, c.d.lanPortLink, float64(link), host, strconv.Itoa(i))
-	}
-	emit(ch, c.d.lanUptime, float64(s.LanInfo.Info.Uptime), host)
 }
 
 // emitDevices 输出终端流量、速率、在线时长与设备详情。
+//
+// 三组指标来自三个端点，各有各的设备列表，覆盖数天然不相等——
+// 实测 RP04 上是 18 / 53 / 82 条，而 count_all 是 99。**count_all 不等于
+// 你能看到的序列数**，跨端点按设备聚合时要留意这个空洞。
+//
+// 也正因为各自独立，端点缺失时必须逐组门控，否则整组会被导成恒 0：
+// R3P 不提供 device_list，若不门控，device_wifi_quality /
+// device_connection_type / device_pcontrol 会稳定输出 0，与
+// 「这些终端真的都没有 WiFi 信号和连接类型」无法分辨。
 func (c *Collector) emitDevices(ch chan<- prometheus.Metric, s *router.Snapshot) {
 	host := c.host
 
@@ -333,54 +390,62 @@ func (c *Collector) emitDevices(ch chan<- prometheus.Metric, s *router.Snapshot)
 		ip   string
 		isAP string
 	}, len(s.DeviceList.List))
-	for _, d := range s.DeviceList.List {
-		if len(d.IP) == 0 {
-			continue
+	if s.Usable(profile.EPDeviceList) {
+		for _, d := range s.DeviceList.List {
+			if len(d.IP) == 0 {
+				continue
+			}
+			ipIndex[d.Mac] = struct {
+				ip   string
+				isAP string
+			}{ip: d.IP[0].IP, isAP: strconv.Itoa(d.IsAP)}
 		}
-		ipIndex[d.Mac] = struct {
-			ip   string
-			isAP string
-		}{ip: d.IP[0].IP, isAP: strconv.Itoa(d.IsAP)}
 	}
 
-	for _, dev := range s.Status.Dev {
-		// 没有 MAC 就是没有身份：路由器把一批设备汇总成了一条
-		// mac="" device_name="Others" 的记录，它不是一个可定位的终端。
-		// MAC 有效但查不到 IP 的设备仍然导出——那是真实终端，
-		// ip="" 诚实表示「IP 未知」，而不是「这台机器不存在」。
-		if !hasIdentity(dev.Mac) {
-			continue
+	if s.Usable(profile.EPStatus) {
+		for _, dev := range s.Status.Dev {
+			// 没有 MAC 就是没有身份：路由器把一批设备汇总成了一条
+			// mac="" device_name="Others" 的记录，它不是一个可定位的终端。
+			// MAC 有效但查不到 IP 的设备仍然导出——那是真实终端，
+			// ip="" 诚实表示「IP 未知」，而不是「这台机器不存在」。
+			if !hasIdentity(dev.Mac) {
+				continue
+			}
+			var devIP, devIsAP string
+			if v, ok := ipIndex[dev.Mac]; ok {
+				devIP, devIsAP = v.ip, v.isAP
+			}
+			emit(ch, c.d.deviceUploadTraffic, toFloat(dev.Upload), host, devIP, dev.Mac, dev.DevName, devIsAP)
+			emit(ch, c.d.deviceDownTraffic, toFloat(dev.Download), host, devIP, dev.Mac, dev.DevName, devIsAP)
 		}
-		var devIP, devIsAP string
-		if v, ok := ipIndex[dev.Mac]; ok {
-			devIP, devIsAP = v.ip, v.isAP
-		}
-		emit(ch, c.d.deviceUploadTraffic, toFloat(dev.Upload), host, devIP, dev.Mac, dev.DevName, devIsAP)
-		emit(ch, c.d.deviceDownTraffic, toFloat(dev.Download), host, devIP, dev.Mac, dev.DevName, devIsAP)
 	}
 
-	for _, dev := range s.DeviceList.List {
-		if len(dev.IP) == 0 {
-			continue
+	if s.Usable(profile.EPDeviceList) {
+		for _, dev := range s.DeviceList.List {
+			if len(dev.IP) == 0 {
+				continue
+			}
+			labels := []string{host, dev.IP[0].IP, dev.Mac, dev.Name, strconv.Itoa(dev.IsAP)}
+			emit(ch, c.d.deviceUploadSpeed, parseFloat(dev.Statistics.UpSpeed), labels...)
+			emit(ch, c.d.deviceDownSpeed, parseFloat(dev.Statistics.DownSpeed), labels...)
+			emit(ch, c.d.deviceOnlineTime, parseFloat(dev.Statistics.Online), labels...)
 		}
-		labels := []string{host, dev.IP[0].IP, dev.Mac, dev.Name, strconv.Itoa(dev.IsAP)}
-		emit(ch, c.d.deviceUploadSpeed, parseFloat(dev.Statistics.UpSpeed), labels...)
-		emit(ch, c.d.deviceDownSpeed, parseFloat(dev.Statistics.DownSpeed), labels...)
-		emit(ch, c.d.deviceOnlineTime, parseFloat(dev.Statistics.Online), labels...)
 	}
 
-	for _, dev := range s.DeviceListV2.Devices {
-		if !hasIdentity(dev.Mac) {
-			continue
+	if s.Usable(profile.EPDeviceListV2) {
+		for _, dev := range s.DeviceListV2.Devices {
+			if !hasIdentity(dev.Mac) {
+				continue
+			}
+			name := dev.Name
+			if name == "" {
+				name = dev.OName
+			}
+			labels := []string{host, dev.IP, dev.Mac, name}
+			emit(ch, c.d.deviceWifiQuality, float64(dev.WifiQuality), labels...)
+			emit(ch, c.d.deviceConnectionType, 1, append(append([]string{}, labels...), strconv.Itoa(dev.ConnectionType))...)
+			emit(ch, c.d.devicePControl, float64(dev.PControl.Enabled), labels...)
 		}
-		name := dev.Name
-		if name == "" {
-			name = dev.OName
-		}
-		labels := []string{host, dev.IP, dev.Mac, name}
-		emit(ch, c.d.deviceWifiQuality, float64(dev.WifiQuality), labels...)
-		emit(ch, c.d.deviceConnectionType, 1, append(append([]string{}, labels...), strconv.Itoa(dev.ConnectionType))...)
-		emit(ch, c.d.devicePControl, float64(dev.PControl.Enabled), labels...)
 	}
 }
 
@@ -388,34 +453,45 @@ func (c *Collector) emitDevices(ch chan<- prometheus.Metric, s *router.Snapshot)
 func (c *Collector) emitWiFi(ch chan<- prometheus.Metric, s *router.Snapshot) {
 	host := c.host
 
-	for _, info := range s.WifiDetailAll.Info {
-		emit(ch, c.d.wifiDetail, parseFloat(info.Status),
-			host, info.Ssid, info.Status, joinBandList(info.ChannelInfo.BandList),
-			fmt.Sprintf("%v", info.ChannelInfo.Channel))
-	}
-
-	emit(ch, c.d.wifiStaCount, float64(s.NewStatus.G2.OnlineStaCount), host, "2.4GHz")
-	emit(ch, c.d.wifiStaCount, float64(s.NewStatus.G5.OnlineStaCount), host, "5GHz")
-	emit(ch, c.d.wifiStaCount, float64(s.NewStatus.G5H.OnlineStaCount), host, "5GHz-high")
-	emit(ch, c.d.meshCapCount, float64(s.NewStatus.CapCount), host)
-	emit(ch, c.d.meshReCount, float64(s.NewStatus.ReCount), host)
-
-	for _, d := range s.WifiConnDevs.List {
-		if !hasIdentity(d.Mac) {
-			continue
+	if s.Usable(profile.EPWifiDetailAll) {
+		for _, info := range s.WifiDetailAll.Info {
+			emit(ch, c.d.wifiDetail, parseFloat(info.Status),
+				host, info.Ssid, info.Status, joinBandList(info.ChannelInfo.BandList),
+				fmt.Sprintf("%v", info.ChannelInfo.Channel))
 		}
-		emit(ch, c.d.wifiDeviceSig, float64(d.Signal), host, d.Mac, c.bandFor(d.WifiIndex))
 	}
 
-	for _, w := range s.WifiList.List {
-		// BSSID 是邻居 AP 的身份。缺了它这条序列就没法定位，
-		// 而这类序列基数又高（README 建议直接 drop），留着纯占资源。
-		if !hasIdentity(w.BSSID) {
-			continue
-		}
-		emit(ch, c.d.neighborWiFiRSSI, float64(w.RSSI), host, w.SSID, w.BSSID, w.Band, strconv.Itoa(w.Channel))
+	// 频段在线数与 Mesh 节点数全部来自 newstatus。R3P 不提供它，
+	// 不门控的话这五个指标会稳定输出 0，看起来像「三个频段都没人连、
+	// 这台机器不是 Mesh 节点」——而真实原因只是这个固件没这个接口。
+	if s.Usable(profile.EPNewStatus) {
+		emit(ch, c.d.wifiStaCount, float64(s.NewStatus.G2.OnlineStaCount), host, "2.4GHz")
+		emit(ch, c.d.wifiStaCount, float64(s.NewStatus.G5.OnlineStaCount), host, "5GHz")
+		emit(ch, c.d.wifiStaCount, float64(s.NewStatus.G5H.OnlineStaCount), host, "5GHz-high")
+		emit(ch, c.d.meshCapCount, float64(s.NewStatus.CapCount), host)
+		emit(ch, c.d.meshReCount, float64(s.NewStatus.ReCount), host)
 	}
-	emit(ch, c.d.neighborWiFiCnt, float64(len(s.WifiList.List)), host)
+
+	if s.Usable(profile.EPWifiConnDevices) {
+		for _, d := range s.WifiConnDevs.List {
+			if !hasIdentity(d.Mac) {
+				continue
+			}
+			emit(ch, c.d.wifiDeviceSig, float64(d.Signal), host, d.Mac, c.bandFor(d.WifiIndex))
+		}
+	}
+
+	if s.Usable(profile.EPWifiList) {
+		for _, w := range s.WifiList.List {
+			// BSSID 是邻居 AP 的身份。缺了它这条序列就没法定位，
+			// 而这类序列基数又高（README 建议直接 drop），留着纯占资源。
+			if !hasIdentity(w.BSSID) {
+				continue
+			}
+			emit(ch, c.d.neighborWiFiRSSI, float64(w.RSSI), host, w.SSID, w.BSSID, w.Band, strconv.Itoa(w.Channel))
+		}
+		emit(ch, c.d.neighborWiFiCnt, float64(len(s.WifiList.List)), host)
+	}
 }
 
 // hasIdentity 判断一个实体是否至少带了一个可用的身份标识。
