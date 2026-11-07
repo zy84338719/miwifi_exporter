@@ -1,6 +1,7 @@
 package profile_test
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -355,5 +356,184 @@ func TestRecheckIntervalIsSane(t *testing.T) {
 	}
 	if profile.RecheckInterval() < time.Minute {
 		t.Fatalf("复探间隔过短（%v），会退化成反复探测", profile.RecheckInterval())
+	}
+}
+
+// TestRepeatedFailureDegradesEndpoint 钉住「重复失败降级」。
+//
+// 真实案例：R3P 上 pppoe_status 连着失败、但又不是 404，自适应探测因此
+// 永远不收敛，scrape_total{result="partial"} 只增不减，一次干净的 success
+// 都不会出现，而 endpoint_supported 始终说 1。
+func TestRepeatedFailureDegradesEndpoint(t *testing.T) {
+	inst := newTestInstance(t, profile.Default)
+
+	const errText = "路由器返回非 2xx status=500 body=internal error"
+	for i := 1; i < profile.RepeatedFailureThreshold; i++ {
+		if inst.NoteRepeatedFailure(profile.EPPppoeStatus, errText) {
+			t.Fatalf("第 %d 次就要求停问，阈值 %d 形同虚设",
+				i, profile.RepeatedFailureThreshold)
+		}
+		if inst.Enabled(profile.EPPppoeStatus) != true {
+			t.Fatalf("第 %d 次后端点不应被停问", i)
+		}
+	}
+
+	if !inst.NoteRepeatedFailure(profile.EPPppoeStatus, errText) {
+		t.Fatal("连续相同错误达到阈值后应要求停问")
+	}
+	inst.Disable(profile.EPPppoeStatus)
+	if inst.Enabled(profile.EPPppoeStatus) {
+		t.Error("停问后 Enabled 应为 false")
+	}
+}
+
+// TestVaryingErrorsDoNotAccumulate 是这条降级路径最重要的安全阀。
+//
+// 判据是「错误文本完全相同」。如果换成「失败次数」，一次路由器重启或
+// 固件升级期间的连续抖动就会把健康端点误杀——这正是超时降级翻过的车。
+func TestVaryingErrorsDoNotAccumulate(t *testing.T) {
+	inst := newTestInstance(t, profile.Default)
+
+	// 错误文本每次都不同：连续 20 次也不该触发停问。
+	for i := 0; i < profile.RepeatedFailureThreshold*4; i++ {
+		if inst.NoteRepeatedFailure(profile.EPStatus, fmt.Sprintf("错误 %d", i)) {
+			t.Fatalf("第 %d 次错误文本变化，却触发了停问", i)
+		}
+	}
+	if !inst.Enabled(profile.EPStatus) {
+		t.Error("错误文本持续变化时端点必须保持启用")
+	}
+}
+
+// TestSuccessResetsRepeatedFailure 保证断续的失败不构成「压根没有」的证据。
+func TestSuccessResetsRepeatedFailure(t *testing.T) {
+	inst := newTestInstance(t, profile.Default)
+
+	const errText = "boom"
+	for i := 0; i < profile.RepeatedFailureThreshold-1; i++ {
+		inst.NoteRepeatedFailure(profile.EPStatus, errText)
+	}
+
+	// 成功一轮：连续计数清零。
+	inst.RecordSuccess(profile.EPStatus)
+	if got := inst.RepeatedFailuresOf(profile.EPStatus); got != 0 {
+		t.Errorf("成功后连续失败计数应清零，实际 %d", got)
+	}
+
+	// 中间成功过一次之后，同样的失败次数不再构成停问理由。
+	for i := 1; i < profile.RepeatedFailureThreshold; i++ {
+		if inst.NoteRepeatedFailure(profile.EPStatus, errText) {
+			t.Fatalf("计数已清零，第 %d 次不该触发停问", i)
+		}
+	}
+}
+
+// TestRepeatedFailureKeyTruncated 守住比较键的长度上限。
+//
+// 某些固件会把整页 HTML 塞进错误消息。不截断的话 map 的键会变成几百 KB
+// 的字符串——每台机器每个端点各一份。
+func TestRepeatedFailureKeyTruncated(t *testing.T) {
+	inst := newTestInstance(t, profile.Default)
+
+	huge := strings.Repeat("A", 100000)
+	for i := 1; i < profile.RepeatedFailureThreshold; i++ {
+		if inst.NoteRepeatedFailure(profile.EPStatus, huge) {
+			t.Fatalf("第 %d 次不该触发停问", i)
+		}
+	}
+	// 前缀相同、后缀不同的两条超长文本必须被认作同一个错误：
+	// 截断后比较键一致，连续计数继续累积，第 5 次触发。
+	if !inst.NoteRepeatedFailure(profile.EPStatus, huge+"B") {
+		t.Error("截断后前缀相同的两条超长错误应视为同一个，并累积到阈值")
+	}
+}
+
+// TestRepeatedFailureClearedOnRecheck 保证复探时计数一并清空，
+// 否则一个曾被停问的端点复探一次就会立刻再次触发停问。
+func TestRepeatedFailureClearedOnRecheck(t *testing.T) {
+	inst := newTestInstance(t, profile.Default)
+
+	const errText = "boom"
+	for i := 0; i < profile.RepeatedFailureThreshold-1; i++ {
+		inst.NoteRepeatedFailure(profile.EPStatus, errText)
+	}
+	inst.Disable(profile.EPStatus)
+
+	// RetryDisabled 以毫秒为单位比较，这里给一个足够小但非零的 ttl，
+	// 再睡过 1ms 让 now - disabledAt 真的达到阈值。
+	time.Sleep(2 * time.Millisecond)
+	revived := inst.RetryDisabled(1)
+	if len(revived) != 1 || revived[0] != profile.EPStatus {
+		t.Fatalf("复探应放回 status，实际 %v", revived)
+	}
+	if got := inst.RepeatedFailuresOf(profile.EPStatus); got != 0 {
+		t.Errorf("复探后连续失败计数应清零，实际 %d", got)
+	}
+}
+
+// newTestInstance 构造一个默认 profile 实例，失败即 t.Fatal。
+func newTestInstance(t *testing.T, name string) *profile.Instance {
+	t.Helper()
+	inst, err := profile.Select(name)
+	if err != nil {
+		t.Fatalf("Select(%q) 失败: %v", name, err)
+	}
+	return inst
+}
+
+// TestPinnedEndpointSurvivesRecheck 是本次真机事故的直接回归测试。
+//
+// R3P 的 pppoe_status 在 compose 里写了 excludeEndpoints，启动日志也确实
+// 打了「按配置排除端点 endpoints=[pppoe_status]」，看上去完全生效。
+// 结果 30 分钟后的一次复探把它放回了探测名单，从此每轮 scrape 都 partial，
+// 而配置里那行字从头到尾没有任何变化——配置形同虚设且毫无提示。
+func TestPinnedEndpointSurvivesRecheck(t *testing.T) {
+	inst := newTestInstance(t, profile.Default)
+	inst.Pin(profile.EPPppoeStatus)
+
+	if inst.Enabled(profile.EPPppoeStatus) {
+		t.Fatal("钉死后端点不应启用")
+	}
+	if got := inst.Pinned(); len(got) != 1 || got[0] != profile.EPPppoeStatus {
+		t.Errorf("Pinned() = %v，期望 [%s]", got, profile.EPPppoeStatus)
+	}
+
+	// 时间远超复探间隔，钉死的端点仍不得被放回。
+	time.Sleep(2 * time.Millisecond)
+	for round := 1; round <= 5; round++ {
+		revived := inst.RetryDisabled(1)
+		for _, ep := range revived {
+			if ep == profile.EPPppoeStatus {
+				t.Fatalf("第 %d 轮复探把配置排除的端点放回了探测名单", round)
+			}
+		}
+		if inst.Enabled(profile.EPPppoeStatus) {
+			t.Fatalf("第 %d 轮复探后端点被启用了，配置排除失效", round)
+		}
+	}
+
+	// Enable 能解除钉死（重启进程即走这条路）。
+	inst.Enable(profile.EPPppoeStatus)
+	if !inst.Enabled(profile.EPPppoeStatus) {
+		t.Error("Enable 后端点应恢复启用")
+	}
+	if got := inst.Pinned(); len(got) != 0 {
+		t.Errorf("Enable 后 Pinned() 应为空，实际 %v", got)
+	}
+}
+
+// TestDisableStillRevives 确认「探测结论」与「配置排除」行为不同：
+// 前者必须能被复探推翻，否则固件升级后新长出来的接口永远采不到。
+func TestDisableStillRevives(t *testing.T) {
+	inst := newTestInstance(t, profile.Default)
+	inst.Disable(profile.EPDeviceList)
+
+	time.Sleep(2 * time.Millisecond)
+	revived := inst.RetryDisabled(1)
+	if len(revived) != 1 || revived[0] != profile.EPDeviceList {
+		t.Fatalf("探测禁用应可被复探恢复，实际 %v", revived)
+	}
+	if !inst.Enabled(profile.EPDeviceList) {
+		t.Error("复探后端点应恢复启用")
 	}
 }

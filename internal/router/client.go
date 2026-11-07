@@ -108,6 +108,11 @@ type Client struct {
 	goodMu   sync.Mutex
 	lastGood map[string]any
 
+	// errMu 保护 lastErrors：最近一轮采集里各失败端点的错误文本，
+	// 供 /routers 展示。指标只能说「哪个端点挂了」，原因只有这里有。
+	errMu      sync.RWMutex
+	lastErrors map[string]string
+
 	closeOnce sync.Once
 }
 
@@ -152,7 +157,11 @@ func New(opts Options) (*Client, error) {
 		if !prof.Profile.Supports(ep) {
 			return nil, oerr.NewBadRequestError("要排除的端点不在任何 profile 的支持范围内: " + ep)
 		}
-		prof.Disable(ep)
+		// 用 Pin 而不是 Disable：配置排除必须永久生效，不参与周期性复探。
+		// 两者混用会让「按配置排除端点」在启动 30 分钟后被静默撤销——
+		// 真机上就这么翻过车，配置里那行字看着一直生效，端点却已被放回
+		// 探测名单并开始每轮报错。
+		prof.Pin(ep)
 	}
 	if len(opts.ExcludeEndpoints) > 0 {
 		logger.Info("按配置排除端点", "endpoints", opts.ExcludeEndpoints)

@@ -10,7 +10,10 @@ import (
 	"time"
 
 	"github.com/oekit/concurrency/async"
+	"github.com/oekit/concurrency/breaker"
 	oerr "github.com/oekit/pkg/errors"
+
+	"github.com/helloworlde/miwifi-exporter/internal/profile"
 )
 
 // EndpointState 描述单个端点在某一轮采集中的结果。
@@ -57,6 +60,28 @@ func (s *Snapshot) Healthy() bool {
 		}
 	}
 	return len(s.Endpoint) > 0
+}
+
+// Usable 报告该端点的值本轮是否可信到可以导出。
+//
+// 「没采到」和「采到了但是零」在监控上完全不是一回事。实测 R3P 不提供
+// newstatus 与 device_list，被 profile 跳过后 Snapshot 里对应的结构体是
+// 全零值，于是 wifi_sta_count、mesh_cap_count、mesh_re_count、
+// device_wifi_quality、device_connection_type、device_pcontrol
+// 这六个指标被稳定导出成 0——和「这台路由器真的一个终端都没有、
+// 没有 Mesh 节点」在指标上完全无法分辨。拿它做告警必然误报。
+//
+// 三种情况都不该导出：
+//   - 端点被 profile 判定为「本固件没有」而跳过（本轮压根没请求）
+//   - 端点本轮失败且没有上一次成功的值可沿用（字段是零值）
+//   - 端点本轮失败但沿用了陈旧值：这一种**仍然要导出**，陈旧与否由
+//     miwifi_exporter_endpoint_stale 显式表达，总好过 rate() 断档
+func (s *Snapshot) Usable(endpoint string) bool {
+	st, ok := s.Endpoint[endpoint]
+	if !ok {
+		return false
+	}
+	return st.OK || st.Stale
 }
 
 // FailedEndpoints 返回本轮失败的端点名（已排序，便于稳定输出与测试断言）。
@@ -247,6 +272,15 @@ func (c *Client) FetchAll(ctx context.Context) *Snapshot {
 					c.profile.Disable(ep.name)
 					c.logger.Info("该固件不提供此端点，已停止采集",
 						"endpoint", ep.name, "profile", c.profile.Name())
+				} else if c.shouldDegrade(ep.name, err) {
+					// 兜底：不是 404，但也已经连着多轮吐出逐字相同的错误。
+					// 没有这条路的话，这类端点会永远停不下来，
+					// scrape_total{result="partial"} 只增不减。
+					c.profile.Disable(ep.name)
+					c.logger.Info("该端点连续返回相同错误，已停止采集",
+						"endpoint", ep.name, "profile", c.profile.Name(),
+						"consecutive", profile.RepeatedFailureThreshold,
+						"err", errText(err))
 				}
 
 				// 超时只计数，不据此停问。
@@ -258,7 +292,7 @@ func (c *Client) FetchAll(ctx context.Context) *Snapshot {
 				// 端点被误关（含 status / lan_info / device_list 等确定可用的）。
 				//
 				// 超时无法区分「这个端点坏了」和「路由器被别的端点堵住了」，
-				// 因此只作为观测信号暴露出来，停问只认 404/501 这种确定性信号。
+				// 因此只作为观测信号暴露出来，停问只认确定性信号。
 				c.profile.RecordResult(ep.name, stderrors.Is(err, context.DeadlineExceeded))
 
 				st.Stale = c.restoreLastGood(ep.name, snap, ep)
@@ -267,7 +301,7 @@ func (c *Client) FetchAll(ctx context.Context) *Snapshot {
 				// 结尾统一汇总成一行输出。
 			} else {
 				st.OK = true
-				c.profile.RecordResult(ep.name, false)
+				c.profile.RecordSuccess(ep.name)
 				c.saveLastGood(ep.name, snap, ep)
 			}
 			results[i] = st
@@ -278,8 +312,60 @@ func (c *Client) FetchAll(ctx context.Context) *Snapshot {
 	for i, ep := range eps {
 		snap.Endpoint[ep.name] = results[i]
 	}
+	c.recordLastErrors(snap, eps)
 	c.logSummary(ctx, snap, time.Since(begin))
 	return snap
+}
+
+// shouldDegrade 判断这次失败是否够格触发「重复失败降级」。
+//
+// 排除三类错误，它们各有各的处置方式，混进来只会误伤：
+//
+//   - 超时：分不清「端点坏了」与「路由器被慢端点堵住」，见 RecordResult。
+//   - 熔断打开：这是**路由器整体**的信号，不是某个端点的。真机实测
+//     wifi_list 触发 WiFi 扫描时会把熔断打开，随后九个本来健康的端点
+//     轮流拿到「circuit breaker is open」。这个错误文本每轮都一样，
+//     正好满足重复失败降级的判据——不排除的话，扫描一次就会把整台
+//     路由器的端点全部停问，正是 RecordResult 注释里警告的那场事故。
+//   - stok 失效：带自愈路径，换个 stok 再试一次就好，不该停问端点。
+func (c *Client) shouldDegrade(endpoint string, err error) bool {
+	if stderrors.Is(err, context.DeadlineExceeded) || stderrors.Is(err, context.Canceled) {
+		return false
+	}
+	if stderrors.Is(err, breaker.ErrCircuitOpen) || stderrors.Is(err, ErrStokInvalid) {
+		return false
+	}
+	return c.profile.NoteRepeatedFailure(endpoint, errText(err))
+}
+
+// recordLastErrors 把本轮每个端点的失败原因记下来，供 /routers 展示。
+//
+// 为什么值得单独记：指标只能告诉你「pppoe_status 挂了」，看不出「为什么挂」。
+// 而失败原因只出现在容器日志里——而容器日志往往就在你想查的那台机器上。
+// 挂到 /routers 上之后，一条 curl 就能拿到，不用 ssh。
+func (c *Client) recordLastErrors(snap *Snapshot, eps []endpoint) {
+	last := make(map[string]string, len(eps))
+	for _, ep := range eps {
+		if st := snap.Endpoint[ep.name]; st.Err != nil {
+			last[ep.name] = errText(st.Err)
+		}
+	}
+
+	c.errMu.Lock()
+	c.lastErrors = last
+	c.errMu.Unlock()
+}
+
+// LastErrors 返回最近一轮采集里各失败端点的错误文本（已排序的键由调用方保证）。
+func (c *Client) LastErrors() map[string]string {
+	c.errMu.RLock()
+	defer c.errMu.RUnlock()
+
+	out := make(map[string]string, len(c.lastErrors))
+	for k, v := range c.lastErrors {
+		out[k] = v
+	}
+	return out
 }
 
 // logSummary 汇总输出本轮采集结果，把十个端点的成败压成一行。

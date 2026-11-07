@@ -130,14 +130,33 @@ type Instance struct {
 	disabled map[string]bool
 	// disabledAt 记录判定时间，用于定期复探（固件升级后接口可能回来）。
 	disabledAt map[string]int64
+	// pinned 记录**由配置显式排除**的端点。
+	//
+	// 它们与「探测判定为不存在」必须分开：探测结论会随固件变化而复探，
+	// 而配置是用户的明确意志，不该被任何自动机制推翻。真机教训：R3P 的
+	// pppoe_status 在 compose 里写了 excludeEndpoints，启动日志也确实打了
+	// 「按配置排除端点」，结果 30 分钟后的一次复探把它放回了探测名单，
+	// 从此每轮 scrape 都 partial——配置形同虚设且毫无提示。
+	pinned map[string]bool
 	// timeouts 记录端点连续超时次数，totalTimeouts 记录累计超时次数。
 	// 两者**仅用于观测**，不参与停问决策——理由见 RecordResult。
 	timeouts      map[string]int
 	totalTimeouts int64
+	// repeated 记录每个端点「连续收到同一个错误」的次数与该错误文本。
+	// 参与停问决策，但判据是错误文本完全相同，见 NoteRepeatedFailure。
+	repeated map[string]repeatedFailure
 	// timeoutThreshold 是连续超时多少次后判定该端点不可用。
 	timeoutThreshold int
 	// now 可注入，便于测试。
 	now func() int64
+}
+
+// repeatedFailure 是一次「连续重复的失败」的计数。
+type repeatedFailure struct {
+	// text 是错误文本（已截断），用作「是不是同一个错误」的比较键。
+	text string
+	// run 是连续相同的次数；一旦 text 变化就归 1。
+	run int
 }
 
 // DefaultTimeoutThreshold 是连续超时的默认降级阈值。
@@ -145,6 +164,31 @@ type Instance struct {
 // 取 3 而不是 1：单次超时可能是路由器忙（刷 WiFi 列表、正在组播），
 // 立刻停问会误伤。三次连续超时基本可以判定这个接口在这台机器上不可用。
 const DefaultTimeoutThreshold = 3
+
+// RepeatedFailureThreshold 是「连续多少次收到完全相同的非超时错误」后
+// 停问该端点。
+//
+// 取 5 而不是 1 或 2：路由器重启、固件升级、并发打满都可能让某个端点连着
+// 失败几轮，阈值太低会把健康端点误杀。而 5 轮（poll 模式下约 2.5 分钟，
+// pull 模式下取决于抓取间隔）已经足够长到能区分「抖动」与「压根没有」。
+//
+// 这个阈值只作用于**错误文本完全相同**的连续失败。文本里带着耗时、端口、
+// 熔断状态这类每次都变的成分时，比较键自然对不上，连续计数不会累积。
+const RepeatedFailureThreshold = 5
+
+// repeatedFailureKeyMax 是错误文本比较键的长度上限。
+//
+// 只为防止某个固件把整页 HTML 或超长 JSON 塞进错误消息里，把 map 的键
+// 撑成一个几百 KB 的字符串。截断后仍然足以区分「同一个错误」。
+const repeatedFailureKeyMax = 200
+
+// noteKey 归一化错误文本，用作「是不是同一个错误」的比较键。
+func noteKey(text string) string {
+	if len(text) > repeatedFailureKeyMax {
+		return text[:repeatedFailureKeyMax]
+	}
+	return text
+}
 
 // NewInstance 用给定的 profile 构造实例。
 func NewInstance(p Profile) *Instance {
@@ -161,7 +205,9 @@ func NewInstanceWithTimeoutThreshold(p Profile, threshold int) *Instance {
 		Profile:          p,
 		disabled:         make(map[string]bool),
 		disabledAt:       make(map[string]int64),
+		pinned:           make(map[string]bool),
 		timeouts:         make(map[string]int),
+		repeated:         make(map[string]repeatedFailure),
 		timeoutThreshold: threshold,
 		now:              unixNow,
 	}
@@ -208,6 +254,9 @@ func (i *Instance) DisabledEndpoints() []string {
 }
 
 // Disable 把端点标记为「本机不存在」，之后不再请求。
+//
+// 这是**探测结论**，会被周期性复探推翻——固件升级后接口可能回来。
+// 配置显式排除请用 Pin。
 func (i *Instance) Disable(endpoint string) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -218,18 +267,57 @@ func (i *Instance) Disable(endpoint string) {
 	i.disabledAt[endpoint] = i.now()
 }
 
-// Enable 恢复一个被禁用的端点。
+// Pin 把端点永久钉在「不采集」状态，**不参与周期性复探**。
+//
+// 用于用户通过 EXCLUDE_ENDPOINTS / routers[].excludeEndpoints 显式排除的端点。
+//
+// 为什么不复用 Disable：探测结论的前提是「这台机器上暂时没有这个接口」，
+// 所以要留复探口子；而配置的前提是「我确定不要这个接口」，复探只会把用户的
+// 明确配置推翻。真机上就是这么翻车的——R3P 的 pppoe_status 在 compose 里
+// 写了 excludeEndpoints，启动日志也打了「按配置排除端点」，30 分钟后的一次
+// 复探把它放回探测名单，此后每轮 scrape 都 partial，而配置里那行字从头到尾
+// 看起来一直在生效。
+//
+// 钉死之后仍可通过 Enable 解除（重启进程即可），代价只是固件升级后需要重启。
+func (i *Instance) Pin(endpoint string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.disabled[endpoint] = true
+	i.disabledAt[endpoint] = i.now()
+	i.pinned[endpoint] = true
+}
+
+// Pinned 返回当前被配置显式排除的端点（已排序）。
+func (i *Instance) Pinned() []string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+
+	var out []string
+	for ep, on := range i.pinned {
+		if on {
+			out = append(out, ep)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Enable 恢复一个被禁用的端点，并解除它的「钉死」状态。
 func (i *Instance) Enable(endpoint string) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	delete(i.disabled, endpoint)
 	delete(i.disabledAt, endpoint)
+	delete(i.pinned, endpoint)
 }
 
 // RetryDisabled 清理掉判定时间超过 ttl 的禁用记录，用于周期性复探。
 //
 // 没有这一步的话，一台路由器固件升级后新长出来的接口就永远采不到了——
 // 「自适应降级」很容易变成「自适应遗忘」。复探通过 Enable 走同一条路径。
+//
+// **钉死的端点（Pin）一律跳过**：复探的前提是「当初的结论可能已经过时」，
+// 而配置排除不是结论，是用户的明确意志。
 func (i *Instance) RetryDisabled(ttlMillis int64) []string {
 	if ttlMillis <= 0 {
 		return nil
@@ -241,10 +329,14 @@ func (i *Instance) RetryDisabled(ttlMillis int64) []string {
 
 	var revived []string
 	for ep := range i.disabled {
+		if i.pinned[ep] {
+			continue
+		}
 		if now-i.disabledAt[ep] >= ttlMillis {
 			delete(i.disabled, ep)
 			delete(i.disabledAt, ep)
 			delete(i.timeouts, ep)
+			delete(i.repeated, ep)
 			revived = append(revived, ep)
 		}
 	}
@@ -258,6 +350,17 @@ func (i *Instance) RetryDisabled(ttlMillis int64) []string {
 // 「路由器被另一个慢端点堵住了」。真机实测：wifi_list 触发 WiFi 扫描时
 // 会阻塞其余全部 LuCI 请求，连带让九个健康端点超时；按超时停问会把
 // 它们全部误杀。停问只认 404/501 这类确定性信号（见 Disable 的调用方）。
+// RecordResult 记录一次**失败**的采集结果，维护连续/累计超时计数。
+//
+// 参数 timedOut 只回答「这一次是不是超时」。传 false 不代表本轮成功——
+// 成功走的是 RecordSuccess。这里刻意不碰 repeated 计数：失败分支里刚由
+// NoteRepeatedFailure 累加的连续失败次数，必须活到下一轮才能累积，
+// 若在同一次失败里被清零，降级逻辑就永远不会触发。
+//
+// **超时不会导致端点被停问**——超时无法区分「这个端点坏了」与
+// 「路由器被另一个慢端点堵住了」。真机实测：wifi_list 触发 WiFi 扫描时
+// 会阻塞其余全部 LuCI 请求，连带让九个健康端点超时；按超时停问会把
+// 它们全部误杀。停问只认 404/501 与重复失败这两种确定性信号。
 func (i *Instance) RecordResult(endpoint string, timedOut bool) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -268,6 +371,55 @@ func (i *Instance) RecordResult(endpoint string, timedOut bool) {
 	}
 	i.timeouts[endpoint]++
 	i.totalTimeouts++
+}
+
+// RecordSuccess 记录一次成功采集，清空该端点的所有连续失败计数。
+//
+// 断续的失败不构成「这台固件压根没有这个接口」的证据——中间成功过就说明
+// 接口还在，只是那几轮路由器自己有状况。
+func (i *Instance) RecordSuccess(endpoint string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	delete(i.timeouts, endpoint)
+	delete(i.repeated, endpoint)
+}
+
+// NoteRepeatedFailure 记录一次**非超时**的端点失败，返回是否应当停问该端点。
+//
+// 为什么需要它：停问原本只认 HTTP 404/501 这一种确定性信号，于是出现了一
+// 类「明显失败却永远停不下来」的端点——实测 R3P 上 pppoe_status 连着报
+// 错，自适应探测永远不收敛，结果 scrape_total{result="partial"} 只增不减，
+// 一次干净的 success 都不会出现，而 endpoint_supported 一直说 1。
+//
+// 为什么判据是「错误文本完全相同」而不是「失败次数」：这条路径不能重蹈
+// 超时降级的覆辙。超时分不清「这个端点坏了」和「路由器被另一个慢端点
+// 堵住了」，实测会把九个健康端点连带误杀。而同一个端点连续 5 轮吐出
+// **逐字相同**的错误，基本不存在巧合——最典型的就是「这台固件没有这个
+// 接口」，LuCI 对不存在的路径返回的正是固定的 404 页面。
+//
+// 停问后仍会按 RecheckDue 复探，所以固件升级后新长出来的接口不会被永久
+// 忘掉；真要立刻停问，用户仍可以用 ExcludeEndpoints 显式排除。
+func (i *Instance) NoteRepeatedFailure(endpoint, errText string) bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	key := noteKey(errText)
+	prev := i.repeated[endpoint]
+	if prev.text != key {
+		prev = repeatedFailure{text: key}
+	}
+	prev.run++
+	i.repeated[endpoint] = prev
+
+	return prev.run >= RepeatedFailureThreshold
+}
+
+// RepeatedFailuresOf 返回端点当前连续相同错误的次数（仅供观测与日志）。
+func (i *Instance) RepeatedFailuresOf(endpoint string) int {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.repeated[endpoint].run
 }
 
 // TotalTimeouts 返回进程内累计的超时次数。
