@@ -2,6 +2,8 @@ package collector
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,6 +71,11 @@ type Set struct {
 	logger    logx.Logger
 
 	reqCtx atomic.Pointer[setRequestCtx]
+
+	// schemaMu / schemaFingerprint 记住上一次记录的端点集合差异，
+	// 用于「差异变化时才记录」的判断。
+	schemaMu          sync.Mutex
+	schemaFingerprint string
 }
 
 // setRequestCtx 包装 ctx 存进 atomic.Pointer。
@@ -260,6 +267,68 @@ func (s *Set) StartBackground(app backgroundApp) {
 		p, host := inst.poller, inst.Spec.Host
 		app.GoBackground("collector:"+host, func(ctx context.Context) { p.Run(ctx) })
 	}
+	// 运行期差异巡检：端点集合的差异可能随运行而变化（404 判定、连续失败
+	// 停采、固件升级后复探恢复……），只在启动时看一次是不够的。
+	app.GoBackground("collector:schema-watch", func(ctx context.Context) { s.watchSchema(ctx) })
+}
+
+// schemaWatchInterval 是运行期差异巡检的间隔。
+const schemaWatchInterval = time.Minute
+
+// watchSchema 定期检查端点集合差异，变化时按成因分级记录。
+//
+// 为什么必须有它：启动那一刻只能看到「配置排除」造成的差异——
+// 「固件不提供」「连续失败被停采」这类结论要等第一轮采集后才成立。
+// 没有这个巡检，这两类差异就永远不会被记录，
+// 「某台因为坏了而少采了端点」这件事只在指标里可见、日志里没有痕迹。
+func (s *Set) watchSchema(ctx context.Context) {
+	ticker := time.NewTicker(schemaWatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.ReportSchemaChange()
+		}
+	}
+}
+
+// ReportSchemaChange 在端点集合差异发生变化时记录日志。
+//
+// 按成因分级：固件能力差异记 INFO（那是事实，不是问题），
+// 配置差异与故障差异记 WARN（需要人处理）。
+//
+// 指纹没变就不重复记录——差异是稳态，每分钟报一次同样的内容纯属噪音。
+func (s *Set) ReportSchemaChange() {
+	diffs := s.schemaDiffs()
+	fp := schemaFingerprint(diffs)
+
+	s.schemaMu.Lock()
+	changed := fp != s.schemaFingerprint
+	s.schemaFingerprint = fp
+	s.schemaMu.Unlock()
+
+	if !changed {
+		return
+	}
+	for _, d := range diffs {
+		if d.Kind == kindFirmware {
+			s.logger.Info("各台采集的接口集合存在固件能力差异", "detail", d.Detail())
+			continue
+		}
+		s.logger.Warn("各台采集的接口集合不一致", "detail", d.Detail())
+	}
+}
+
+// schemaFingerprint 给一组差异算一个指纹，用于判断「变了没有」。
+func schemaFingerprint(diffs []schemaDiff) string {
+	parts := make([]string, 0, len(diffs))
+	for _, d := range diffs {
+		parts = append(parts, d.Kind+"|"+d.MissingHost+"|"+d.Endpoint)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ";")
 }
 
 // backgroundApp 是 bootstrap.App 里本包需要的那一小部分。
