@@ -1,0 +1,121 @@
+# miwifi_exporter 的 Prometheus 告警规则。
+#
+# 全部基于 exporter 自带的自监控指标，不需要额外的 exporter 或 sidecar。
+#
+# 用法一（Prometheus 原生 rule_files）：
+#
+#   rule_files:
+#     - /etc/prometheus/rules/miwifi-alerts.yaml
+#
+# 用法二（Prometheus Operator）：
+#
+#   kubectl apply -f deploy/prometheus/miwifi-alerts.yaml
+#
+# 改 job 名：规则里用 job=~"miwifi.*" 匹配，按你的实际 job 名调整即可。
+#
+# 阈值说明：
+#   - 采集间隔 30s（COLLECT_INTERVAL），所以 snapshot_age 的告警线取 90s（3 倍）
+#   - router_up 的告警线取 5m：路由器重启、刷 WiFi 列表都可能短暂不可达，
+#     立即告警只会制造噪音
+groups:
+  - name: miwifi-exporter
+    interval: 1m
+    rules:
+      # ── exporter 自身 ────────────────────────────────────────────────
+      # 最该有却一直缺的一条：采集机进程没了、端口不通、容器崩了，
+      # 下面所有指标都会一起消失，而「没有数据」本身不会触发任何告警。
+      - alert: MiwifiExporterDown
+        expr: up{job=~"miwifi.*"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "miwifi_exporter 抓取失败"
+          description: >-
+            实例 {{ $labels.instance }} 已连续 3 分钟抓不到 /metrics。
+            采集机本身可能已停机（进程退出、容器挂了、端口被占）。
+
+      # ── 路由器可达性 ────────────────────────────────────────────────
+      # router_up 的语义是「这台路由器我们采到数据了吗」，不是「每个端点都成功」。
+      # 实测：路由器重启或被 WiFi 扫描阻塞时会短暂为 0，所以给 5 分钟宽限。
+      - alert: MiwifiRouterUnreachable
+        expr: miwifi_exporter_router_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "路由器 {{ $labels.host }} 采集不可达"
+          description: >-
+            路由器 {{ $labels.host }} 已连续 5 分钟采不到数据。
+            可能是路由器离线、链路中断，或该路由器所在站点整体不通。
+            先看 exporter 日志里的失败原因，再确认链路。
+
+      # ── 采集新鲜度（poll 模式专用）─────────────────────────────────
+      # poll 模式下 /metrics 只读内存快照，快照多久没更新就说明后台采集卡住了。
+      # 阈值 = 采集间隔的 3 倍（30s → 90s）。
+      - alert: MiwifiSnapshotStale
+        expr: miwifi_exporter_snapshot_age_seconds > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.host }} 的快照已 {{ $value | humanizeDuration }} 未更新"
+          description: >-
+            后台采集可能已经卡住。检查 exporter 日志里是否有采集超时，
+            以及该路由器的端点是否全部熔断。
+
+      # ── 端点被停采 ─────────────────────────────────────────────────
+      # reason 标签说明停采原因：
+      #   not_supported    固件压根不提供这个接口（正常，不是故障）
+      #   repeated_failure 连续多轮返回相同错误（真有问题）
+      #   config           配置显式排除（人为决定，不是故障）
+      # 这里排除 config：那是用户的明确意志，不该报警。
+      - alert: MiwifiEndpointRepeatedFailure
+        expr: miwifi_exporter_endpoint_disabled{reason="repeated_failure"} == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.host }} 的端点 {{ $labels.endpoint }} 已停止采集"
+          description: >-
+            该端点连续多轮返回相同错误，已被判定为不可用而停止请求。
+            指标将不再更新（可能沿用陈旧值）。
+            原因见 exporter 日志或 /routers 的 endpointErrors 字段。
+
+      # ── 端点持续失败 ───────────────────────────────────────────────
+      # 还在采集、但反复失败的端点。
+      - alert: MiwifiEndpointFailing
+        expr: increase(miwifi_exporter_endpoint_errors_total[10m]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.host }} 的端点 {{ $labels.endpoint }} 10 分钟内失败 ≥3 次"
+          description: >-
+            该端点反复采集失败。失败原因见 exporter 日志，
+            或 curl 采集机的 /routers 看 endpointErrors 字段。
+
+      # ── 导出的是陈旧值 ─────────────────────────────────────────────
+      # 端点失败但有上次成功值可沿用时，指标照常导出、值却是旧的。
+      # 不告警的话，图上看不出「这个数字已经多久没更新」。
+      - alert: MiwifiEndpointServingStaleValue
+        expr: miwifi_exporter_endpoint_stale == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.host }} 的端点 {{ $labels.endpoint }} 导出的是陈旧值"
+          description: >-
+            该端点本轮采集失败，当前导出的是上一次成功留下的值。
+            持续 15 分钟以上说明它不是偶发抖动。
+
+      # ── 整轮采集失败 ───────────────────────────────────────────────
+      # router_up=0 已经有专门的规则；这里针对「部分失败」的整体统计。
+      - alert: MiwifiCollectRepeatedFailure
+        expr: increase(miwifi_exporter_scrape_total{result="failure"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.host }} 15 分钟内出现整轮采集失败"
+          description: >-
+            采集结果为 failure（连一个端点都没成功）。
+            通常意味着路由器完全不可达或会话失效。
