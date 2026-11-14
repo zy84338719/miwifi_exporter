@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	stderrors "errors"
@@ -114,9 +115,8 @@ type endpoint struct {
 // 以及运行期自适应探测出来的「这台机器上实际有什么」。
 // 被过滤掉的端点连一次请求都不会发，自然也不会有 WARN 日志和恒零指标。
 func (c *Client) enabledEndpoints() []endpoint {
-	all := c.allEndpoints()
-	out := make([]endpoint, 0, len(all))
-	for _, ep := range all {
+	out := make([]endpoint, 0, len(c.endpoints))
+	for _, ep := range c.endpoints {
 		if c.profile.Enabled(ep.name) {
 			out = append(out, ep)
 		}
@@ -124,105 +124,109 @@ func (c *Client) enabledEndpoints() []endpoint {
 	return out
 }
 
-func (c *Client) allEndpoints() []endpoint {
+// buildEndpoints 构造端点表。端点与 Client 一一对应、此后不再变化，
+// 因此只在构造期调用一次（见 New）。
+//
+// 过去这里每轮采集都重建一遍：10 个结构体 + 30 个闭包，全是每轮一次的垃圾。
+func (c *Client) buildEndpoints() []endpoint {
 	return []endpoint{
 		{
 			name: "status", path: pathStatus,
 			fetch: func(ctx context.Context, s *Snapshot) error { return c.call(ctx, pathStatus, &s.Status) },
-			save:  func(s *Snapshot) any { return &s.Status },
+			save:  func(s *Snapshot) any { return s.Status },
 			restore: func(s *Snapshot, v any) {
-				if p, ok := v.(*Status); ok {
-					s.Status = *p
+				if p, ok := v.(Status); ok {
+					s.Status = p
 				}
 			},
 		},
 		{
 			name: "devicelist", path: pathDeviceList,
 			fetch: func(ctx context.Context, s *Snapshot) error { return c.call(ctx, pathDeviceList, &s.DeviceList) },
-			save:  func(s *Snapshot) any { return &s.DeviceList },
+			save:  func(s *Snapshot) any { return s.DeviceList },
 			restore: func(s *Snapshot, v any) {
-				if p, ok := v.(*DeviceList); ok {
-					s.DeviceList = *p
+				if p, ok := v.(DeviceList); ok {
+					s.DeviceList = p
 				}
 			},
 		},
 		{
 			name: "newstatus", path: pathNewStatus,
 			fetch: func(ctx context.Context, s *Snapshot) error { return c.call(ctx, pathNewStatus, &s.NewStatus) },
-			save:  func(s *Snapshot) any { return &s.NewStatus },
+			save:  func(s *Snapshot) any { return s.NewStatus },
 			restore: func(s *Snapshot, v any) {
-				if p, ok := v.(*NewStatus); ok {
-					s.NewStatus = *p
+				if p, ok := v.(NewStatus); ok {
+					s.NewStatus = p
 				}
 			},
 		},
 		{
 			name: "device_list", path: pathDeviceListV2,
 			fetch: func(ctx context.Context, s *Snapshot) error { return c.call(ctx, pathDeviceListV2, &s.DeviceListV2) },
-			save:  func(s *Snapshot) any { return &s.DeviceListV2 },
+			save:  func(s *Snapshot) any { return s.DeviceListV2 },
 			restore: func(s *Snapshot, v any) {
-				if p, ok := v.(*DeviceListV2); ok {
-					s.DeviceListV2 = *p
+				if p, ok := v.(DeviceListV2); ok {
+					s.DeviceListV2 = p
 				}
 			},
 		},
 		{
 			name: "wan_info", path: pathWanInfo,
 			fetch: c.fetchWanInfo,
-			save:  func(s *Snapshot) any { return &s.WanInfo },
+			save:  func(s *Snapshot) any { return s.WanInfo },
 			restore: func(s *Snapshot, v any) {
-				if p, ok := v.(*Info); ok {
-					s.WanInfo = *p
+				if p, ok := v.(Info); ok {
+					s.WanInfo = p
 				}
 			},
 		},
 		{
 			name: "wifi_detail_all", path: pathWifiDetailAll,
 			fetch: func(ctx context.Context, s *Snapshot) error { return c.call(ctx, pathWifiDetailAll, &s.WifiDetailAll) },
-			save:  func(s *Snapshot) any { return &s.WifiDetailAll },
+			save:  func(s *Snapshot) any { return s.WifiDetailAll },
 			restore: func(s *Snapshot, v any) {
-				if p, ok := v.(*WifiDetailAll); ok {
-					s.WifiDetailAll = *p
+				if p, ok := v.(WifiDetailAll); ok {
+					s.WifiDetailAll = p
 				}
 			},
 		},
 		{
 			name: "pppoe_status", path: pathPppoeStatus,
 			fetch: func(ctx context.Context, s *Snapshot) error { return c.call(ctx, pathPppoeStatus, &s.PppoeStatus) },
-			save:  func(s *Snapshot) any { return &s.PppoeStatus },
+			save:  func(s *Snapshot) any { return s.PppoeStatus },
 			restore: func(s *Snapshot, v any) {
-				if p, ok := v.(*PppoeStatus); ok {
-					s.PppoeStatus = *p
+				if p, ok := v.(PppoeStatus); ok {
+					s.PppoeStatus = p
 				}
 			},
 		},
 		{
 			name: "lan_info", path: pathLanInfo,
 			fetch: func(ctx context.Context, s *Snapshot) error { return c.call(ctx, pathLanInfo, &s.LanInfo) },
-			save:  func(s *Snapshot) any { return &s.LanInfo },
+			save:  func(s *Snapshot) any { return s.LanInfo },
 			restore: func(s *Snapshot, v any) {
-				if p, ok := v.(*LanInfo); ok {
-					s.LanInfo = *p
+				if p, ok := v.(LanInfo); ok {
+					s.LanInfo = p
 				}
 			},
 		},
 		{
 			name: "wifi_connect_devices", path: pathWifiConnDevice,
 			fetch: func(ctx context.Context, s *Snapshot) error { return c.call(ctx, pathWifiConnDevice, &s.WifiConnDevs) },
-			save:  func(s *Snapshot) any { return &s.WifiConnDevs },
+			save:  func(s *Snapshot) any { return s.WifiConnDevs },
 			restore: func(s *Snapshot, v any) {
-				if p, ok := v.(*WifiConnectDevices); ok {
-					s.WifiConnDevs = *p
+				if p, ok := v.(WifiConnectDevices); ok {
+					s.WifiConnDevs = p
 				}
 			},
 		},
 		{
 			name: "wifi_list", path: pathWifiList,
 			fetch: func(ctx context.Context, s *Snapshot) error { return c.call(ctx, pathWifiList, &s.WifiList) },
-			save:  func(s *Snapshot) any { return &s.WifiList },
+			save:  func(s *Snapshot) any { return s.WifiList },
 			restore: func(s *Snapshot, v any) {
-				if p, ok := v.(*WifiList); ok {
-					s.WifiList = *p
+				if p, ok := v.(WifiList); ok {
+					s.WifiList = p
 				}
 			},
 		},
@@ -447,13 +451,14 @@ func (c *Client) fetchWanInfo(ctx context.Context, s *Snapshot) error {
 		return err
 	}
 
-	if _, isBool := outer.Info.(bool); isBool {
+	// info 要么是对象，要么是 JSON false（WAN 未连接）。
+	//
+	// 用 json.RawMessage 接住原始字节，比过去「先解成 any、再 Marshal、
+	// 再 Unmarshal」少一整轮编解码——那个来回把 wan_info 的响应体解析了两遍。
+	raw := bytes.TrimSpace(outer.Info)
+	if len(raw) == 0 || string(raw) == "false" || string(raw) == "null" {
 		s.WanInfo = Info{}
 		return nil
-	}
-	raw, err := json.Marshal(outer.Info)
-	if err != nil {
-		return oerr.Wrap(err, "序列化 WAN 信息失败")
 	}
 	var info Info
 	if err := json.Unmarshal(raw, &info); err != nil {

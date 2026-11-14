@@ -4,6 +4,8 @@
 // 指标如何表达属于 internal/collector 的事，两者通过 Snapshot 解耦。
 package router
 
+import "encoding/json"
+
 // Status 对应 /api/misystem/status，路由器整机状态。
 type Status struct {
 	Dev []struct {
@@ -151,8 +153,14 @@ type DeviceListV2 struct {
 // info 字段在 WAN 未连接时是 bool（false）、连接时是对象，因此这里用 any 承接，
 // 由 FetchWanInfo 二次反序列化到内层 Info。
 type WanInfo struct {
-	Info any `json:"info"`
-	Code int `json:"code"`
+	// Info 是内层信息的原始字节。
+	//
+	// 用 json.RawMessage 而不是 any：wan_info 的 info 字段在 WAN 未连接时是
+	// JSON false、连接时是对象。接成 any 之后只能「再序列化回 JSON、再解析一遍」
+	// 才能拿到具体结构——那一圈来回把整个响应体编解码了两遍。留原始字节，
+	// 判断 false 与解析对象各走各的。
+	Info json.RawMessage `json:"info"`
+	Code int             `json:"code"`
 }
 
 // Info 是 wan_info 的内层结构。

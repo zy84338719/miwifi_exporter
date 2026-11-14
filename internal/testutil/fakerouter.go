@@ -37,6 +37,11 @@ type FakeRouter struct {
 	delay time.Duration
 	// pendingFail 里的 API 会失败 pendingFail[path] 次后再成功。
 	pendingFail map[string]int
+	// stokFailureStatus 是 stok 失效时的 HTTP 状态码。
+	//
+	// 0 表示「按真机行为回 200 + {"code":401}」（默认）；403 表示模拟
+	// 「回 403 的固件」。默认取真机形态，否则测试就永远跑不到那条路径。
+	stokFailureStatus int
 }
 
 // NewFakeRouter 启动一个假路由器并注册默认样本数据。
@@ -150,9 +155,22 @@ func (f *FakeRouter) handleAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if stok != validStok {
-		// stok 不匹配：路由器在 stok 失效时回 403。
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"code":-1}`))
+		// stok 不匹配：**真机回的是 HTTP 200 + {"code":401,"msg":"Invalid token"}**，
+		// 不是 401/403（RA70 固件 1.0.140、R3P 固件 2.16.29 实测一致）。
+		//
+		// 过去这里建模成 403，于是整个测试套件从没跑过真机的真实形态：
+		// exporter 只按 HTTP 状态码判错，200 + code:401 被当成一次成功采集——
+		// 载荷解析成全零结构、端点记成成功、永不重新登录。真机上表现为
+		// 「指标大面积消失但一切看起来正常」。
+		//
+		// 两种形态都保留：SetStokFailureStatus 可以切回 403，覆盖回 403 的固件。
+		w.Header().Set("Content-Type", "application/json")
+		if f.stokFailureStatus == http.StatusForbidden {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"code":-1,"msg":"invalid token"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":401,"msg":"Invalid token"}`))
 		return
 	}
 	if forceFail {
@@ -198,6 +216,16 @@ func (f *FakeRouter) SetStok(stok string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ValidStok = stok
+}
+
+// SetStokFailureStatus 设置 stok 失效时的 HTTP 状态码。
+//
+// 传 0 恢复默认行为：回 200 + {"code":401,"msg":"Invalid token"}（真机形态）。
+// 传 403 则模拟回 403 的固件。
+func (f *FakeRouter) SetStokFailureStatus(code int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stokFailureStatus = code
 }
 
 // SetFail 让某个 API 持续返回 500。

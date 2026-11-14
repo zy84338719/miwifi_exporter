@@ -88,6 +88,19 @@ type Client struct {
 	retry   retry.Config
 	breaker breaker.Breaker
 
+	// baseTimeout 是全局单请求超时预算。登录这类没有端点级预算的请求用它。
+	//
+	// 它与 http.Client.Timeout 的区别：后者是客户端级兜底，会把按端点分配的
+	// 预算（profile 内置的 wifi_list=20s、用户覆盖的 lan_info=8s）统统压回
+	// 同一个值——于是「按端点给不同超时」这件事在实现上是失效的。
+	// 每条请求的 deadline 都由 request() 里的 ctx 提供，不需要客户端兜底。
+	baseTimeout time.Duration
+	// endpoints 是端点表，只在构造期建一次。
+	//
+	// 过去每轮采集都重建一遍：10 个结构体 + 30 个闭包，全是每轮一次的垃圾。
+	// 端点表与 Client 一一对应、此后不再变化，建一次即可。
+	endpoints []endpoint
+
 	// stokTTLValue 由 Options 归一化而来，构造后不再变化。
 	stokTTLValue time.Duration
 	// timeoutOverrides 是用户为个别端点指定的超时预算。
@@ -175,14 +188,16 @@ func New(opts Options) (*Client, error) {
 		return nil, oerr.Wrap(err, "创建 cookie jar 失败")
 	}
 
-	return &Client{
+	c := &Client{
 		baseURL:  strings.TrimSuffix(opts.BaseURL, "/"),
 		password: opts.Password,
 		logger:   logger,
 		profile:  prof,
 		http: &http.Client{
-			Timeout: timeout,
-			Jar:     jar,
+			// 不设客户端级 Timeout：它是全局兜底，会把按端点分配的预算统统压回
+			// 同一个值——「按端点给不同超时」在实现上等于没做。每条请求的
+			// deadline 由 request() 里的 ctx 提供，够用。
+			Jar: jar,
 			Transport: &http.Transport{
 				DialContext:           (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext,
 				MaxIdleConnsPerHost:   16,
@@ -193,10 +208,13 @@ func New(opts Options) (*Client, error) {
 		},
 		retry:            rcfg,
 		breaker:          breaker.NewBreaker("miwifi-router"),
+		baseTimeout:      timeout,
 		stokTTLValue:     ttl,
 		timeoutOverrides: opts.EndpointTimeouts,
 		lastGood:         make(map[string]any),
-	}, nil
+	}
+	c.endpoints = c.buildEndpoints()
+	return c, nil
 }
 
 // IsRetryable 判断错误是否值得重试。
@@ -208,6 +226,19 @@ func IsRetryable(err error) bool {
 		return false
 	}
 	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// 这三类重试只会重复同一个必然失败的动作：
+	//
+	//   - 端点不存在（404/501）：固件压根没这个接口，问一万次也是 404。
+	//     过去它会走满 3 次尝试 + 200/400ms 退避，白白多打两次请求、
+	//     多等 0.6s，而且与「404 一次就确定」的处置相矛盾。
+	//   - stok 失效：call() 有专门的「换新 stok 再试一次」自愈路径，
+	//     在这里再重试 3 次等于拿同一个已失效的 stok 撞 3 次墙。
+	//   - 错误信封：路由器明说 code != 0，重试同样的请求没有意义。
+	if stderrors.Is(err, ErrEndpointMissing) ||
+		stderrors.Is(err, ErrStokInvalid) ||
+		stderrors.Is(err, ErrAPIError) {
 		return false
 	}
 	return true
@@ -270,21 +301,19 @@ func (c *Client) refreshStok(ctx context.Context) (string, error) {
 // ROUTER_TIMEOUT 调到 30s 时不会被某个端点的窄预算悄悄压回去——
 // 调大全局超时本意就是「我愿意等更久」。
 func (c *Client) endpointTimeout(apiPath string) time.Duration {
-	base := c.http.Timeout
+	base := c.baseTimeout
 	if base <= 0 {
 		base = defaultTimeout
 	}
-	for name, p := range apiPathIndex {
-		if p != apiPath {
-			continue
-		}
-		if d, ok := c.timeoutOverrides[name]; ok && d > base {
-			return d
-		}
-		if d, ok := c.profile.Profile.TimeoutFor(name); ok && d > base {
-			return d
-		}
-		break
+	name, ok := apiPathToEndpoint[apiPath]
+	if !ok {
+		return base
+	}
+	if d, ok := c.timeoutOverrides[name]; ok && d > base {
+		return d
+	}
+	if d, ok := c.profile.Profile.TimeoutFor(name); ok && d > base {
+		return d
 	}
 	return base
 }
@@ -432,22 +461,42 @@ func resetTarget(out any) {
 	}
 }
 
+// isEmptyTarget 判断目标结构体是否还是零值。
+//
+// 用途只有一个：识别「拿到的其实是错误信封而不是数据」。载荷是空的、
+// 而信封里 code != 0 ⇒ 这轮取数失败，而不是「路由器真的什么都没有」。
+func isEmptyTarget(out any) bool {
+	v := reflect.ValueOf(out)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return false
+	}
+	elem := v.Elem()
+	switch elem.Kind() {
+	case reflect.Struct, reflect.Map, reflect.Slice, reflect.Array, reflect.Interface:
+		return elem.IsZero()
+	}
+	return false
+}
+
 // apiPath 是不带 stok 前缀的 API 路径。
 //
 // 名字部分复用 profile 包的端点常量，避免「profile 里叫 status、
 // client 里叫 pathStatus」这种改名时对不上的漂移。
-// apiPathIndex 给出「端点名 → API 路径」的反查表，用于按端点定位超时预算。
-var apiPathIndex = map[string]string{
-	profile.EPStatus:          pathStatus,
-	profile.EPDeviceList:      pathDeviceList,
-	profile.EPNewStatus:       pathNewStatus,
-	profile.EPDeviceListV2:    pathDeviceListV2,
-	profile.EPWanInfo:         pathWanInfo,
-	profile.EPWifiDetailAll:   pathWifiDetailAll,
-	profile.EPPppoeStatus:     pathPppoeStatus,
-	profile.EPLanInfo:         pathLanInfo,
-	profile.EPWifiConnDevices: pathWifiConnDevice,
-	profile.EPWifiList:        pathWifiList,
+// apiPathToEndpoint 是「API 路径 → 端点名」的反查表，用于按端点定位超时预算。
+//
+// 过去每次算超时预算都要遍历整张「端点名 → API 路径」表（10 项）才能定位端点名，
+// 而这条路径在每个端点的每次尝试里都会走一遍。
+var apiPathToEndpoint = map[string]string{
+	pathStatus:         profile.EPStatus,
+	pathDeviceList:     profile.EPDeviceList,
+	pathNewStatus:      profile.EPNewStatus,
+	pathDeviceListV2:   profile.EPDeviceListV2,
+	pathWanInfo:        profile.EPWanInfo,
+	pathPppoeStatus:    profile.EPPppoeStatus,
+	pathLanInfo:        profile.EPLanInfo,
+	pathWifiList:       profile.EPWifiList,
+	pathWifiDetailAll:  profile.EPWifiDetailAll,
+	pathWifiConnDevice: profile.EPWifiConnDevices,
 }
 
 var (

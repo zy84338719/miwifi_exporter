@@ -50,7 +50,7 @@ func (c *Client) doLogin(ctx context.Context) (session, error) {
 	}
 
 	var initInfo InitInfo
-	if err := c.getJSON(ctx, "/cgi-bin/luci/api/xqsystem/init_info", &initInfo, c.http.Timeout); err != nil {
+	if err := c.getJSON(ctx, "/cgi-bin/luci/api/xqsystem/init_info", &initInfo, c.baseTimeout); err != nil {
 		return session{}, oerr.Wrap(err, "获取 init_info 失败")
 	}
 
@@ -110,12 +110,12 @@ func (c *Client) doLogin(ctx context.Context) (session, error) {
 
 // getRaw 发一个 GET 并返回原始响应体。
 func (c *Client) getRaw(ctx context.Context, path string) ([]byte, error) {
-	return c.request(ctx, http.MethodGet, path, nil, c.http.Timeout)
+	return c.request(ctx, http.MethodGet, path, nil, c.baseTimeout)
 }
 
 // postForm 以 application/x-www-form-urlencoded 提交并返回原始响应体。
 func (c *Client) postForm(ctx context.Context, path string, form url.Values) ([]byte, error) {
-	return c.request(ctx, http.MethodPost, path, strings.NewReader(form.Encode()), c.http.Timeout)
+	return c.request(ctx, http.MethodPost, path, strings.NewReader(form.Encode()), c.baseTimeout)
 }
 
 // getJSON 发一个 GET 并把响应解码到 out。
@@ -124,8 +124,32 @@ func (c *Client) getJSON(ctx context.Context, path string, out any, timeout time
 	if err != nil {
 		return err
 	}
+
+	// 错误信封必须先于载荷识别。
+	//
+	// 小米路由器的 stok 失效时回的是 HTTP 200 + {"code":401,"msg":"Invalid token"}，
+	// 不是 401/403。把它当正常载荷解，结果就是一个全零结构：mac/sn 变空串、
+	// uptime 变 0、设备级序列整片消失，而端点还被记成「成功」——
+	// 指标大面积消失却没有任何报错，也永远不会触发重新登录。
+	//
+	// 识别出来后 401 会被归一成 ErrStokInvalid，正好落进 call() 的
+	// 「换新 stok 再试一次」自愈路径。
+	if looksLikeErrorEnvelope(body) {
+		if apiErr := apiErrorFromBody(body); apiErr != nil {
+			return apiErr
+		}
+	}
+
 	if err := json.Unmarshal(body, out); err != nil {
 		return oerr.Wrap(err, "解析 JSON 失败", "path", path)
+	}
+
+	// 载荷解出来是空的，也按错误信封再查一遍：信封里 code 不在第一个键时
+	// （例如 {"bsd":"miwifi","code":401,...}）上面的前缀判断不会命中。
+	if isEmptyTarget(out) {
+		if apiErr := apiErrorFromBody(body); apiErr != nil {
+			return apiErr
+		}
 	}
 	return nil
 }
