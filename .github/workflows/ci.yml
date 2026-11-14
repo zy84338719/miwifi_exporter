@@ -123,6 +123,15 @@ jobs:
 
       # 一次多架构构建即完成推送；冒烟测试直接拉取刚推上去的 amd64 变体，
       # 不重复构建。
+      # build_date 由构建时刻注入。
+      #
+      # 过去只传了 VERSION，main.buildDate 保持默认值 "unknown"，
+      # 于是 ghcr 上的镜像无法判断是什么时候构建的——线上排查时
+      # 只能靠 image digest，反查成本很高。
+      - name: compute build date
+        id: build_date
+        run: echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: build and push
         id: build
         uses: docker/build-push-action@v6
@@ -135,6 +144,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
+            BUILD_DATE=${{ steps.build_date.outputs.date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

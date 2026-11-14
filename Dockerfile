@@ -12,9 +12,12 @@ RUN go mod download
 COPY . .
 
 ARG VERSION=dev
+# BUILD_DATE 由 CI 注入（见 .github/workflows/ci.yml 的 compute build date 步骤）。
+# 不传时 main.buildDate 保持默认值 unknown。
+ARG BUILD_DATE=unknown
 RUN CGO_ENABLED=0 go build \
     -trimpath \
-    -ldflags "-s -w -X main.version=${VERSION}" \
+    -ldflags "-s -w -X main.version=${VERSION} -X main.buildDate=${BUILD_DATE}" \
     -o /out/miwifi-exporter .
 
 # ---- runtime ----
