@@ -28,6 +28,7 @@ type selfMetrics struct {
 	endpointErrors    *prometheus.CounterVec
 	endpointDur       *prometheus.GaugeVec
 	endpointSupported *prometheus.GaugeVec
+	endpointDisabled  *prometheus.GaugeVec
 	snapshotAge       *prometheus.GaugeVec
 	routerUp          *prometheus.GaugeVec
 	// prof 用于在 Collect 时现算 endpoint_supported。
@@ -120,6 +121,10 @@ func newSelfMetrics(opts selfMetricOptions) *selfMetrics {
 			Namespace: ns, Subsystem: exporter, Name: "endpoint_supported",
 			Help: "当前固件 profile 是否认为本机提供该端点（1=提供，0=已跳过）",
 		}, []string{"host", "endpoint"}),
+		endpointDisabled: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Subsystem: exporter, Name: "endpoint_disabled",
+			Help: "端点是否已被停止采集（1=已停采，0=仍在采集）；reason 标签说明停采原因：not_supported=固件不提供、repeated_failure=连续失败、config=配置排除，空=未停采",
+		}, []string{"host", "endpoint", "reason"}),
 		snapshotAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Subsystem: exporter, Name: "snapshot_age_seconds",
 			Help: "当前快照的年龄（秒）——poll 模式下即采集新鲜度",
@@ -145,6 +150,12 @@ func newSelfMetrics(opts selfMetricOptions) *selfMetrics {
 		m.endpointErrors.WithLabelValues(h, name)
 		m.endpointDur.WithLabelValues(h, name)
 		m.endpointSupported.WithLabelValues(h, name).Set(1)
+		m.endpointDisabled.WithLabelValues(h, name, "").Set(0)
+	}
+	if opts.Prof != nil {
+		for name, reason := range opts.Prof.DisabledReasons() {
+			m.endpointDisabled.WithLabelValues(h, name, reason).Set(1)
+		}
 	}
 	m.snapshotAge.WithLabelValues(h).Set(0)
 	m.routerUp.WithLabelValues(h).Set(0)
@@ -169,6 +180,7 @@ func (m *selfMetrics) Describe(ch chan<- *prometheus.Desc) {
 	m.endpointErrors.Describe(ch)
 	m.endpointDur.Describe(ch)
 	m.endpointSupported.Describe(ch)
+	m.endpointDisabled.Describe(ch)
 	m.snapshotAge.Describe(ch)
 	m.routerUp.Describe(ch)
 }
@@ -176,13 +188,40 @@ func (m *selfMetrics) Describe(ch chan<- *prometheus.Desc) {
 // Collect 供 prometheus.Collector 接口使用。
 func (m *selfMetrics) Collect(ch chan<- prometheus.Metric) {
 	// 在自己的 Collect 里刷新，保证本次抓取看到的就是当前 profile 状态。
+	// 先整体重置：reason 是标签值，停采原因变了之后旧标签组合必须消失，
+	// 否则同一个端点会同时挂着两个 reason=1 的序列。
+	m.endpointDisabled.Reset()
 	if m.prof != nil {
+		disabledReasons := m.prof.DisabledReasons()
 		for _, name := range profile.AllEndpoints {
 			supported := 1.0
 			if !m.prof.Enabled(name) {
 				supported = 0
 			}
 			m.endpointSupported.WithLabelValues(m.host, name).Set(supported)
+			// endpoint_disabled 把「已经停采」单独标出来。
+			//
+			// 为什么需要它：endpoint_supported=0 只说明「没在采」，
+			// 而「没在采」有两种完全不同的原因——
+			//
+			//   - profile 压根不支持（这台的固件就没有这个接口，正常）
+			//   - 跑着跑着被停掉了（404 判定 / 连续失败 / 配置排除）
+			//
+			// 第二种是**运行时状态**：它会变（固件升级、配置调整），
+			// 而 endpoint_errors_total 对已停采的端点永远是 0
+			//（端点不在采集轮次里，失败计数根本没机会递增）。
+			// 于是「某个端点已经坏了」这件事在 Prometheus 里无迹可寻。
+			// 有了 endpoint_disabled，三种状态就能分开看：
+			//
+			//   supported=1                    → 正常在采
+			//   supported=0 disabled=0         → profile 不支持（固件没有，正常）
+			//   supported=0 disabled=1         → 曾支持但已停采（需要关注）
+			reason := disabledReasons[name]
+			d := 0.0
+			if reason != "" {
+				d = 1
+			}
+			m.endpointDisabled.WithLabelValues(m.host, name, reason).Set(d)
 		}
 	}
 
@@ -193,6 +232,7 @@ func (m *selfMetrics) Collect(ch chan<- prometheus.Metric) {
 	m.endpointErrors.Collect(ch)
 	m.endpointDur.Collect(ch)
 	m.endpointSupported.Collect(ch)
+	m.endpointDisabled.Collect(ch)
 	m.snapshotAge.Collect(ch)
 	m.routerUp.Collect(ch)
 }

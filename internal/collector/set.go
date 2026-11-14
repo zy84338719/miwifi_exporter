@@ -11,6 +11,7 @@ import (
 	oerr "github.com/oekit/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/helloworlde/miwifi-exporter/internal/profile"
 	"github.com/helloworlde/miwifi-exporter/internal/router"
 )
 
@@ -316,11 +317,26 @@ type RouterStatus struct {
 	// 而原因只出现在容器日志里——排查的人却未必有那台机器的 ssh。
 	// 一条 curl 拿到错误文本，比翻日志快一个数量级。
 	EndpointErrors map[string]string `json:"endpointErrors,omitempty"`
-	// Schema 标记这台导出的端点集合是否与其余各台一致，见 SchemaDivergence。
+	// SchemaAligned 标记这台导出的端点集合是否**不比基准台少**，见 schemaAligned。
+	//
+	// 语义在 1.19.3 起调整过：早先它表示「与第一台完全一致」，
+	// 于是不同型号的路由器必然为 false——而把两台强行对齐的唯一办法
+	// 是排除掉真实存在的数据（把支持 newstatus 的那台也排掉，
+	// 连在线终端数 wifi_sta_count 一起丢掉）。
+	// 现在它表达的是「跨台对比时这台会不会少东西」，这才是真正要紧的问题。
 	SchemaAligned bool `json:"schemaAligned"`
+	// SchemaDiff 列出这台与基准台之间的端点差异及原因，仅在有差异时出现。
+	//
+	// 为什么需要它：schemaAligned 只能回答「有没有缺口」，
+	// 但排查时更想知道「差在哪、为什么差」——是固件本来就没有，
+	// 还是这台坏了。两者的处置完全相反。
+	SchemaDiff []string `json:"schemaDiff,omitempty"`
 }
 
-// SchemaDivergence 检查各台启用的端点集合是否一致，返回不一致的说明。
+// SchemaDivergence 返回各台之间的全部端点集合差异说明（不分成因）。
+//
+// 想知道「差在哪」看它；想知道「哪些需要人处理」看 SchemaWarnings；
+// 想知道「哪些只是固件能力不同」看 SchemaNotes。
 //
 // 为什么需要它：profile 的**唯一**全局效果是决定采哪些接口，而接口集合
 // 直接决定导出的指标集合。给 A 台配 default、给 B 台配 no-scan 之后，
@@ -333,49 +349,11 @@ type RouterStatus struct {
 // 也就是说「不同路由器用不同 profile」不只是 schema 不一致，
 // 还可能让其中几台彻底采不到数据。
 func (s *Set) SchemaDivergence() []string {
-	if len(s.instances) < 2 {
-		return nil
+	var out []string
+	for _, d := range s.schemaDiffs() {
+		out = append(out, d.Detail())
 	}
-	base := s.instances[0].Client.Profile().EnabledEndpoints()
-	baseSet := toSet(base)
-
-	var warnings []string
-	for _, inst := range s.instances[1:] {
-		got := inst.Client.Profile().EnabledEndpoints()
-		gotSet := toSet(got)
-
-		var missing, extra []string
-		for _, ep := range got {
-			if !baseSet[ep] {
-				missing = append(missing, ep)
-			}
-		}
-		for _, ep := range base {
-			if !gotSet[ep] {
-				extra = append(extra, ep)
-			}
-		}
-		if len(missing) == 0 && len(extra) == 0 {
-			continue
-		}
-		warnings = append(warnings, formatDivergence(
-			s.instances[0].Spec.Host, inst.Spec.Host,
-			s.instances[0].Client.Profile().Name(), inst.Client.Profile().Name(),
-			missing, extra))
-	}
-	return warnings
-}
-
-func formatDivergence(hostA, hostB, profileA, profileB string, missing, extra []string) string {
-	var parts []string
-	if len(extra) > 0 {
-		parts = append(parts, "相比 "+hostA+" 缺少: "+joinStr(extra))
-	}
-	if len(missing) > 0 {
-		parts = append(parts, "相比 "+hostA+" 多出: "+joinStr(missing))
-	}
-	return hostA + "(" + profileA + ") 与 " + hostB + "(" + profileB + ") 采集的接口集合不一致 —— " +
-		joinStr(parts) + "；两台导出的指标集合会不同，建议统一 profile"
+	return out
 }
 
 func toSet(items []string) map[string]bool {
@@ -397,10 +375,170 @@ func joinStr(items []string) string {
 	return out
 }
 
-// SchemaWarnings 返回需要写进日志的 schema 一致性告警。
-func (s *Set) SchemaWarnings() []string { return s.SchemaDivergence() }
+// 端点集合差异的三种成因。
+//
+// 分成三类是因为处置方式完全不同：配置差异要人改配置，
+// 故障差异要人修机器，而固件差异**什么都不用做**——那台机器本来就没有
+// 这个接口，把它当成问题去「统一」只会白白丢掉真实存在的数据。
+const (
+	// kindConfig 表示差异来自人为配置（profile 选得不一样、显式排除端点）。
+	kindConfig = "config"
+	// kindFirmware 表示差异来自固件能力（这台压根不提供该接口）。
+	kindFirmware = "firmware"
+	// kindFault 表示差异来自故障（连续失败被停采）。
+	kindFault = "fault"
+)
 
-// schemaAligned 判断某台的端点集合是否与第一台一致。
+// schemaDiff 描述两台路由器之间的一个端点集合差异。
+type schemaDiff struct {
+	BaseHost     string
+	BaseProfile  string
+	OtherHost    string
+	OtherProfile string
+	// MissingHost 是缺少该端点的那台。
+	MissingHost string
+	Endpoint    string
+	Reason      string
+	Kind        string
+}
+
+// Detail 返回给人看的一行说明。
+func (d schemaDiff) Detail() string {
+	return d.BaseHost + "(" + d.BaseProfile + ") 与 " + d.OtherHost + "(" + d.OtherProfile +
+		") 的端点集合不一致 —— " + d.MissingHost + " 缺 " + d.Endpoint + "（" + d.Reason + "）"
+}
+
+// schemaDiffs 列出各台与基准台之间的端点集合差异。
+//
+// 基准台是 routers 数组的第一台。
+func (s *Set) schemaDiffs() []schemaDiff {
+	if len(s.instances) < 2 {
+		return nil
+	}
+	baseInst := s.instances[0]
+	baseProf := baseInst.Client.Profile()
+	baseEnabled := baseProf.EnabledEndpoints()
+	baseSet := toSet(baseEnabled)
+
+	var out []schemaDiff
+	for _, inst := range s.instances[1:] {
+		otherProf := inst.Client.Profile()
+		got := otherProf.EnabledEndpoints()
+		gotSet := toSet(got)
+
+		// 基准台在采、这台不采
+		for _, ep := range baseEnabled {
+			if gotSet[ep] {
+				continue
+			}
+			reason, kind := diffReason(inst, ep)
+			out = append(out, schemaDiff{
+				BaseHost: baseInst.Spec.Host, BaseProfile: baseProf.Name(),
+				OtherHost: inst.Spec.Host, OtherProfile: otherProf.Name(),
+				MissingHost: inst.Spec.Host, Endpoint: ep,
+				Reason: reason, Kind: kind,
+			})
+		}
+		// 这台在采、基准台不采
+		for _, ep := range got {
+			if baseSet[ep] {
+				continue
+			}
+			reason, kind := diffReason(baseInst, ep)
+			out = append(out, schemaDiff{
+				BaseHost: baseInst.Spec.Host, BaseProfile: baseProf.Name(),
+				OtherHost: inst.Spec.Host, OtherProfile: otherProf.Name(),
+				MissingHost: baseInst.Spec.Host, Endpoint: ep,
+				Reason: reason, Kind: kind,
+			})
+		}
+	}
+	return out
+}
+
+// diffReason 说明某个端点为什么没被采集，并给出差异的成因分类。
+func diffReason(inst *Instance, ep string) (string, string) {
+	prof := inst.Client.Profile()
+	switch r := prof.DisableReason(ep); r {
+	case profile.ReasonConfig:
+		return "配置显式排除", kindConfig
+	case profile.ReasonNotSupported:
+		return "固件不提供该接口", kindFirmware
+	case profile.ReasonRepeatedFailure:
+		return "连续返回相同错误，已停止采集", kindFault
+	case profile.ReasonUnavailable:
+		return "已判定不可用", kindFirmware
+	case "":
+		if !prof.Profile.Supports(ep) {
+			return "profile 不支持该端点", kindConfig
+		}
+		return "原因未知", kindFault
+	default:
+		return r, kindFirmware
+	}
+}
+
+// SchemaWarnings 返回**需要人处理**的差异说明：配置不一致或故障导致的缺口。
+//
+// 这两类才值得 WARN：前者要改配置，后者要修机器。
+func (s *Set) SchemaWarnings() []string {
+	var out []string
+	for _, d := range s.schemaDiffs() {
+		if d.Kind == kindFirmware {
+			continue
+		}
+		out = append(out, d.Detail())
+	}
+	return out
+}
+
+// SchemaNotes 返回**固件能力差异**的说明。
+//
+// 不同型号的路由器固件能力本就不同（实测 Home-GFW 的 R3P 不提供
+// newstatus / pppoe_status，Home-RA70 的 RA70 两者都有），
+// 这类差异是事实而不是缺陷：写 INFO 说明清楚即可，
+// 跨台比较时用 endpoint_supported 过滤掉即可。
+//
+// 早先这类差异也是 WARN，还建议「统一 profile」——而异构机型下
+// 集合完全一致根本做不到，强行统一的唯一办法是丢掉真实存在的数据。
+func (s *Set) SchemaNotes() []string {
+	var out []string
+	for _, d := range s.schemaDiffs() {
+		if d.Kind != kindFirmware {
+			continue
+		}
+		out = append(out, d.Detail())
+	}
+	return out
+}
+
+// schemaDiffFor 返回某台与基准台之间的差异说明（供 /routers 展示）。
+func (s *Set) schemaDiffFor(host string) []string {
+	var out []string
+	for _, d := range s.schemaDiffs() {
+		if d.MissingHost != host && d.OtherHost != host {
+			continue
+		}
+		out = append(out, d.Detail())
+	}
+	return out
+}
+
+// schemaAligned 判断某台的端点集合是否**不比基准台少**。
+//
+// 语义（1.19.3 起调整）：只看「少了」，不看「多了」。
+//
+//   - 比基准台多采几个端点 → 能力差异，不是问题
+//   - 比基准台少采几个端点 → 这台的指标集合缺东西，跨台对比会失真
+//
+// 为什么不再要求「完全一致」：不同型号的路由器固件能力本就不同
+// （实测 Home-GFW 的 R3P 不提供 newstatus/pppoe_status，
+// Home-RA70 的 RA70 两者都有），集合完全一致在这个场景下根本做不到，
+// 而强行「统一」的唯一办法是把真实存在的数据也排掉——
+// 连在线终端数 wifi_sta_count 一起丢掉。
+//
+// 早先的语义（集合完全相同）会让 schemaAligned 在异构机型下恒为 false，
+// 于是「两台指标口径不同」被当成缺陷反复提示，而它其实是事实。
 //
 // 第一台作为基准而不是「多数派」：配置里 routers 数组的第一项通常就是
 // 基准那台，用它做参照最符合直觉，也不会因为顺序抖动而变化。
@@ -414,9 +552,6 @@ func (s *Set) schemaAligned(host string) bool {
 			continue
 		}
 		got := toSet(inst.Client.Profile().EnabledEndpoints())
-		if len(base) != len(got) {
-			return false
-		}
 		for ep := range base {
 			if !got[ep] {
 				return false
@@ -459,6 +594,7 @@ func (s *Set) Status() []RouterStatus {
 			Timeouts:       inst.Client.Profile().TotalTimeouts(),
 			EndpointErrors: inst.Client.LastErrors(),
 			SchemaAligned:  s.schemaAligned(inst.Spec.Host),
+			SchemaDiff:     s.schemaDiffFor(inst.Spec.Host),
 		}
 		if inst.poller != nil {
 			st.Ready = inst.poller.Ready()

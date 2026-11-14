@@ -7,6 +7,7 @@ import (
 	stderrors "errors"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -273,14 +274,14 @@ func (c *Client) FetchAll(ctx context.Context) *Snapshot {
 			if err != nil {
 				// 固件压根没有这个接口：404 一次就确定，停掉别再问。
 				if stderrors.Is(err, ErrEndpointMissing) {
-					c.profile.Disable(ep.name)
+					c.profile.DisableWithReason(ep.name, profile.ReasonNotSupported)
 					c.logger.Info("该固件不提供此端点，已停止采集",
 						"endpoint", ep.name, "profile", c.profile.Name())
 				} else if c.shouldDegrade(ep.name, err) {
 					// 兜底：不是 404，但也已经连着多轮吐出逐字相同的错误。
 					// 没有这条路的话，这类端点会永远停不下来，
 					// scrape_total{result="partial"} 只增不减。
-					c.profile.Disable(ep.name)
+					c.profile.DisableWithReason(ep.name, profile.ReasonRepeatedFailure)
 					c.logger.Info("该端点连续返回相同错误，已停止采集",
 						"endpoint", ep.name, "profile", c.profile.Name(),
 						"consecutive", profile.RepeatedFailureThreshold,
@@ -388,6 +389,7 @@ func (c *Client) logSummary(ctx context.Context, snap *Snapshot, elapsed time.Du
 	failed := snap.FailedEndpoints()
 	if len(failed) == 0 {
 		c.logger.CtxDebug(ctx, "采集完成", "elapsed", elapsed, "endpoints", len(snap.Endpoint))
+		c.noteRecovered(ctx)
 		return
 	}
 
@@ -418,12 +420,22 @@ func (c *Client) logSummary(ctx context.Context, snap *Snapshot, elapsed time.Du
 		reasons = append(reasons, text)
 	}
 
+	// 同质失败聚合：同一组失败原因反复出现时，按间隔聚合成一条，
+	// 而不是每轮都刷一遍一模一样的长行。
+	//
+	// 首次出现、失败形态变化、或聚合窗口到期时才真正打出来。
+	sig := strings.Join(order, "\x00")
+	if !c.shouldLogFailure(sig) {
+		return
+	}
+
 	c.logger.CtxWarn(ctx, "采集部分失败",
 		"elapsed", elapsed,
 		"failed", len(failed),
 		"total", len(snap.Endpoint),
 		"endpoints", failed,
-		"reasons", reasons)
+		"reasons", reasons,
+		"持续", c.failureDuration().Round(time.Second).String())
 
 	// 逐端点全量详情留给 DEBUG：排查时需要，正常运行时纯属噪声。
 	for _, name := range failed {
@@ -431,6 +443,76 @@ func (c *Client) logSummary(ctx context.Context, snap *Snapshot, elapsed time.Du
 		c.logger.CtxDebug(ctx, "端点采集失败",
 			"endpoint", name, "err", errText(st.Err), "using_stale_value", st.Stale)
 	}
+}
+
+// failureLogInterval 是同质失败的日志聚合窗口。
+//
+// 取 5 分钟：既能把「一小时 132 行」压成十几行，又不会让一次持续很久的
+// 故障在日志里长时间没有任何动静。
+const failureLogInterval = 5 * time.Minute
+
+// shouldLogFailure 判断这一轮失败是否值得再打一条日志。
+//
+// 规则：
+//
+//   - 失败指纹与上一轮不同 → 打（失败形态变了，是新信息）
+//   - 指纹相同且距上次输出不足 failureLogInterval → 不打
+//   - 指纹相同但聚合窗口到期 → 打
+func (c *Client) shouldLogFailure(sig string) bool {
+	c.failLogMu.Lock()
+	defer c.failLogMu.Unlock()
+
+	now := time.Now()
+	if c.lastFailSig != sig {
+		c.lastFailSig = sig
+		c.lastFailSince = now
+		c.lastFailLogAt = now
+		return true
+	}
+	if now.Sub(c.lastFailLogAt) >= failureLogInterval {
+		c.lastFailLogAt = now
+		return true
+	}
+	return false
+}
+
+// failureDuration 返回当前这轮故障已经持续多久（尚未发生故障时返回 0）。
+func (c *Client) failureDuration() time.Duration {
+	c.failLogMu.Lock()
+	defer c.failLogMu.Unlock()
+	if c.lastFailSince.IsZero() {
+		return 0
+	}
+	return time.Since(c.lastFailSince)
+}
+
+// noteRecovered 在采集恢复正常时打一条 INFO。
+//
+// 没有这条日志的话，一次持续三小时的故障在日志里只有「坏了、坏了、坏了」，
+// 没有「好了」——排查的人无法确认链路是否已经恢复。
+func (c *Client) noteRecovered(ctx context.Context) {
+	c.failLogMu.Lock()
+	since := c.lastFailSince
+	had := c.lastFailSig != ""
+	c.lastFailSig = ""
+	c.lastFailSince = time.Time{}
+	c.lastFailLogAt = time.Time{}
+	c.failLogMu.Unlock()
+
+	if !had {
+		return
+	}
+	args := []any{"持续", time.Since(since).Round(time.Second).String()}
+	// 带上已停采的端点：恢复的是「这一轮没失败」，不等于「所有端点都正常」。
+	//
+	// 典型场景：某个端点 404 一次就被判定停采，下一轮自然不再失败——
+	// 这时候打「采集已恢复」而不说明它已被永久停采，会让人以为一切正常。
+	if c.profile != nil {
+		if disabled := c.profile.DisabledEndpoints(); len(disabled) > 0 {
+			args = append(args, "已停采端点", disabled)
+		}
+	}
+	c.logger.CtxInfo(ctx, "采集已恢复", args...)
 }
 
 func errText(err error) string {

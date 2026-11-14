@@ -117,6 +117,18 @@ type LoginPageParser interface {
 	Describe() string
 }
 
+// 端点被停采的原因。取值固定、跨版本稳定，外部（指标、日志、HTTP API）按字符串消费。
+const (
+	// ReasonNotSupported 表示固件压根不提供该接口（404 一次就确定）。
+	ReasonNotSupported = "not_supported"
+	// ReasonRepeatedFailure 表示连续多轮返回逐字相同的错误。
+	ReasonRepeatedFailure = "repeated_failure"
+	// ReasonConfig 表示由配置显式排除。
+	ReasonConfig = "config"
+	// ReasonUnavailable 是不带更精确原因时的兜底值。
+	ReasonUnavailable = "unavailable"
+)
+
 // Instance 是一个 Profile 的运行期实例，额外承载「自适应探测」的状态。
 //
 // 为什么不让 Profile 自己可变：profile 会被注册到全局 Registry（多个
@@ -130,6 +142,18 @@ type Instance struct {
 	disabled map[string]bool
 	// disabledAt 记录判定时间，用于定期复探（固件升级后接口可能回来）。
 	disabledAt map[string]int64
+	// disabledReason 记录端点被停采的原因，**仅用于观测**，不参与任何决策。
+	//
+	// 三个值：
+	//
+	//   - ReasonNotSupported    固件不提供该接口（404 一次就确定）
+	//   - ReasonRepeatedFailure 连续多轮返回逐字相同的错误
+	//   - ReasonConfig          由配置显式排除（Pin）
+	//
+	// 为什么要记：endpoint_up=0 只说明「没采到」，说不出「为什么没采」。
+	// 跨台比较时更需要分清「这台固件本来就没有」（正常）与「这台坏了」
+	// （要处理）——两者的处置完全相反。
+	disabledReason map[string]string
 	// pinned 记录**由配置显式排除**的端点。
 	//
 	// 它们与「探测判定为不存在」必须分开：探测结论会随固件变化而复探，
@@ -205,6 +229,7 @@ func NewInstanceWithTimeoutThreshold(p Profile, threshold int) *Instance {
 		Profile:          p,
 		disabled:         make(map[string]bool),
 		disabledAt:       make(map[string]int64),
+		disabledReason:   make(map[string]string),
 		pinned:           make(map[string]bool),
 		timeouts:         make(map[string]int),
 		repeated:         make(map[string]repeatedFailure),
@@ -258,6 +283,14 @@ func (i *Instance) DisabledEndpoints() []string {
 // 这是**探测结论**，会被周期性复探推翻——固件升级后接口可能回来。
 // 配置显式排除请用 Pin。
 func (i *Instance) Disable(endpoint string) {
+	i.DisableWithReason(endpoint, ReasonUnavailable)
+}
+
+// DisableWithReason 把端点标记为「本机不存在」，并记下停采原因。
+//
+// 原因只用于观测与排查，不影响停采决策本身：三种原因都意味着
+// 「这一轮不去问它」。
+func (i *Instance) DisableWithReason(endpoint, reason string) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.disabled[endpoint] {
@@ -265,6 +298,42 @@ func (i *Instance) Disable(endpoint string) {
 	}
 	i.disabled[endpoint] = true
 	i.disabledAt[endpoint] = i.now()
+	i.disabledReason[endpoint] = reason
+}
+
+// DisableReason 返回端点被停采的原因；未被停采时返回空串。
+func (i *Instance) DisableReason(endpoint string) string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.disabledReason[endpoint]
+}
+
+// DisabledReasons 返回「端点名 → 停采原因」的副本。
+func (i *Instance) DisabledReasons() map[string]string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	out := make(map[string]string, len(i.disabledReason))
+	for ep, r := range i.disabledReason {
+		out[ep] = r
+	}
+	return out
+}
+
+// PinnedEndpoints 返回由配置显式排除的端点（已排序）。
+//
+// 它与「探测判定为不存在」必须分开：探测结论会随固件变化而复探，
+// 而配置是用户的明确意志，不该被任何自动机制推翻。
+func (i *Instance) PinnedEndpoints() []string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	out := make([]string, 0, len(i.pinned))
+	for ep, on := range i.pinned {
+		if on {
+			out = append(out, ep)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Pin 把端点永久钉在「不采集」状态，**不参与周期性复探**。
@@ -284,6 +353,7 @@ func (i *Instance) Pin(endpoint string) {
 	defer i.mu.Unlock()
 	i.disabled[endpoint] = true
 	i.disabledAt[endpoint] = i.now()
+	i.disabledReason[endpoint] = ReasonConfig
 	i.pinned[endpoint] = true
 }
 

@@ -103,6 +103,21 @@ type Client struct {
 
 	// stokTTLValue 由 Options 归一化而来，构造后不再变化。
 	stokTTLValue time.Duration
+
+	// 失败日志聚合状态。
+	//
+	// 一台路由器长时间不可达时，每一轮都会产生一条内容完全相同的
+	// 「采集部分失败」WARN（实测 .71 上 1 小时 132 行，且每行都把
+	// 七个端点名重复一遍）。真出现这种故障时人只需要知道「它还坏着、
+	// 已经坏了多久」，不需要每 30 秒被同一句话刷一次。
+	//
+	// 这里记住上一轮的失败指纹：
+	//   - 指纹变了 → 失败形态变了，是新信息，必须立刻打出来
+	//   - 指纹没变 → 同一件事，按 failureLogInterval 聚合成一条
+	failLogMu     sync.Mutex
+	lastFailSig   string
+	lastFailSince time.Time
+	lastFailLogAt time.Time
 	// timeoutOverrides 是用户为个别端点指定的超时预算。
 	timeoutOverrides map[string]time.Duration
 

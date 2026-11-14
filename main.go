@@ -119,6 +119,12 @@ func serve(cfg *config.Config, logger logx.Logger, level logx.Level) error {
 	if err != nil {
 		return oerr.Wrap(err, "初始化采集器失败")
 	}
+	// 固件能力差异属正常事实：不同型号的路由器固件能力本就不同。
+	// 跨台比较时按 endpoint_supported 过滤即可，不必也不该为了「看起来一致」
+	// 去排除掉真实存在的数据。
+	for _, n := range set.SchemaNotes() {
+		logger.Info("各台采集的接口集合存在固件能力差异", "detail", n)
+	}
 	for _, w := range set.SchemaWarnings() {
 		logger.Warn("各台采集的接口集合不一致", "detail", w)
 	}
