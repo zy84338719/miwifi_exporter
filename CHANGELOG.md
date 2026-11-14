@@ -1,9 +1,38 @@
 # Changelog
 
-> **1.19.4 是当前最新版本**。1.19.3 补的是**可观测性**：把「某个端点已经
-> 坏了」这件事实从日志里搬进指标，并给故障日志降噪；1.19.4 补上运行期的
-> 差异巡检。1.19.2 修的「静默假零」与 1.19.0 的**破坏性变更**
-> （一批聚合指标改为「有条件导出」）仍然适用。
+> **1.19.5 是当前最新版本**。它补上 exporter 自身的运行时指标，并把 dashboard
+> 与仓库里已有的 ikuai 那套对齐成同一风格。1.19.3/1.19.4 补的**可观测性**
+> （端点停采状态、故障日志降噪、运行期差异巡检）、1.19.2 修的「静默假零」
+> 与 1.19.0 的**破坏性变更**（一批聚合指标改为「有条件导出」）仍然适用。
+
+---
+
+## 1.19.5
+
+### 新增：exporter 自身的运行时指标（3 条）
+
+以前 exporter 自己的内存与 goroutine 状态**完全不可见**——`/metrics` 里一个
+`go_*`/`process_*` 序列都没有。于是「内存是不是在涨」「goroutine 是不是
+在堆积」只能 ssh 上机器看，而排查采集机的人未必有那台机器的 ssh。
+
+新增三条：
+
+| 指标 | 用途 |
+|---|---|
+| `miwifi_exporter_goroutines` | goroutine 堆积（poll 模式每轮起十个端点 goroutine） |
+| `miwifi_exporter_heap_inuse_bytes` | 堆内占用上涨 = 疑似内存泄漏 |
+| `miwifi_exporter_memory_sys_bytes` | 向系统申请的总量 |
+
+**刻意不注册 client_golang 那套完整的 Go collector**：它会带进
+`go_*` / `process_*` 几十条与路由器无关的序列，污染小型 Prometheus 的存储
+（`main.go` 里本来就记了这个取舍）。这里只留能回答上面两个问题的最小集合。
+
+### dashboard 风格与 ikuai_exporter 对齐
+
+新写的 dashboard 之前是英文标题 + query 变量，与仓库里已有的
+`ikuai-dashboard.json`（中文标题 + adhoc `Filters` 变量）不是一套风格，
+两套并排看很别扭。现在统一成 ikuai 那套：中文标题、adhoc `Filters`
+变量、schemaVersion 38，并补上 exporter 自身的内存面板（17 个面板）。
 
 ---
 
