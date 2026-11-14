@@ -21,70 +21,12 @@
   "panels": [
     {
       "type": "stat",
-      "title": "Exporter 实例在线",
+      "title": "路由器可达数",
       "id": 1,
       "gridPos": {
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 0
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "targets": [
-        {
-          "expr": "count(up{job=~\"miwifi.*\"})",
-          "legendFormat": "实例",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "min": 0,
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 1
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      }
-    },
-    {
-      "type": "stat",
-      "title": "路由器可达 / 总数",
-      "id": 2,
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 4,
         "y": 0
       },
       "datasource": {
@@ -117,7 +59,8 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "mappings": []
         },
         "overrides": []
       },
@@ -138,11 +81,11 @@
     {
       "type": "stat",
       "title": "被停采的端点",
-      "id": 3,
+      "id": 2,
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 8,
+        "x": 4,
         "y": 0
       },
       "datasource": {
@@ -175,7 +118,8 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "mappings": []
         },
         "overrides": []
       },
@@ -196,11 +140,11 @@
     {
       "type": "stat",
       "title": "导出陈旧值的端点",
-      "id": 4,
+      "id": 3,
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 12,
+        "x": 8,
         "y": 0
       },
       "datasource": {
@@ -233,7 +177,8 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "mappings": []
         },
         "overrides": []
       },
@@ -253,12 +198,12 @@
     },
     {
       "type": "stat",
-      "title": "快照新鲜度 (秒)",
-      "id": 5,
+      "title": "快照新鲜度",
+      "id": 4,
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 16,
+        "x": 12,
         "y": 0
       },
       "datasource": {
@@ -291,7 +236,8 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "mappings": []
         },
         "overrides": []
       },
@@ -312,11 +258,11 @@
     {
       "type": "stat",
       "title": "采集失败轮次(15m)",
-      "id": 6,
+      "id": 5,
       "gridPos": {
         "h": 4,
         "w": 4,
-        "x": 20,
+        "x": 16,
         "y": 0
       },
       "datasource": {
@@ -349,7 +295,67 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "exporter 内存",
+      "id": 6,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "miwifi_exporter_memory_sys_bytes",
+          "legendFormat": "内存",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": []
         },
         "overrides": []
       },
@@ -370,7 +376,7 @@
     {
       "type": "timeseries",
       "title": "路由器可达性",
-      "id": 10,
+      "id": 7,
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -383,7 +389,7 @@
       },
       "targets": [
         {
-          "expr": "miwifi_exporter_router_up{host=~\"$host\"}",
+          "expr": "miwifi_exporter_router_up",
           "legendFormat": "{{host}}",
           "refId": "A"
         }
@@ -420,7 +426,7 @@
     {
       "type": "timeseries",
       "title": "快照新鲜度（poll 模式）",
-      "id": 11,
+      "id": 8,
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -433,7 +439,7 @@
       },
       "targets": [
         {
-          "expr": "miwifi_exporter_snapshot_age_seconds{host=~\"$host\"}",
+          "expr": "miwifi_exporter_snapshot_age_seconds",
           "legendFormat": "{{host}}",
           "refId": "A"
         }
@@ -470,7 +476,7 @@
     {
       "type": "timeseries",
       "title": "端点最近一次采集耗时",
-      "id": 12,
+      "id": 9,
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -483,7 +489,7 @@
       },
       "targets": [
         {
-          "expr": "miwifi_exporter_endpoint_duration_seconds{host=~\"$host\"}",
+          "expr": "miwifi_exporter_endpoint_duration_seconds",
           "legendFormat": "{{host}} / {{endpoint}}",
           "refId": "A"
         }
@@ -520,7 +526,7 @@
     {
       "type": "timeseries",
       "title": "WAN 速率",
-      "id": 20,
+      "id": 10,
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -533,12 +539,12 @@
       },
       "targets": [
         {
-          "expr": "miwifi_wan_upload_speed{host=~\"$host\"}",
+          "expr": "miwifi_wan_upload_speed",
           "legendFormat": "{{host}} 上行 KB/s",
           "refId": "A"
         },
         {
-          "expr": "miwifi_wan_download_speed{host=~\"$host\"}",
+          "expr": "miwifi_wan_download_speed",
           "legendFormat": "{{host}} 下行 KB/s",
           "refId": "B"
         }
@@ -575,7 +581,7 @@
     {
       "type": "timeseries",
       "title": "在线终端数（按频段）",
-      "id": 21,
+      "id": 11,
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -588,7 +594,7 @@
       },
       "targets": [
         {
-          "expr": "miwifi_wifi_sta_count{host=~\"$host\"}",
+          "expr": "miwifi_wifi_sta_count",
           "legendFormat": "{{host}} {{band}}",
           "refId": "A"
         }
@@ -625,7 +631,7 @@
     {
       "type": "timeseries",
       "title": "终端流量速率合计",
-      "id": 22,
+      "id": 12,
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -638,12 +644,12 @@
       },
       "targets": [
         {
-          "expr": "sum by (host) (miwifi_device_upload_speed{host=~\"$host\"})",
+          "expr": "sum by (host) (miwifi_device_upload_speed)",
           "legendFormat": "{{host}} 上行",
           "refId": "A"
         },
         {
-          "expr": "sum by (host) (miwifi_device_download_speed{host=~\"$host\"})",
+          "expr": "sum by (host) (miwifi_device_download_speed)",
           "legendFormat": "{{host}} 下行",
           "refId": "B"
         }
@@ -680,10 +686,10 @@
     {
       "type": "timeseries",
       "title": "CPU 负载与内存",
-      "id": 30,
+      "id": 13,
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 20
       },
@@ -693,12 +699,12 @@
       },
       "targets": [
         {
-          "expr": "miwifi_cpu_load{host=~\"$host\"}",
+          "expr": "miwifi_cpu_load",
           "legendFormat": "{{host}} load",
           "refId": "A"
         },
         {
-          "expr": "miwifi_memory_usage{host=~\"$host\"}",
+          "expr": "miwifi_memory_usage",
           "legendFormat": "{{host}} 内存占比",
           "refId": "B"
         }
@@ -734,12 +740,12 @@
     },
     {
       "type": "timeseries",
-      "title": "路由器在线时长（秒）",
-      "id": 31,
+      "title": "路由器在线时长",
+      "id": 14,
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 20
       },
       "datasource": {
@@ -748,7 +754,7 @@
       },
       "targets": [
         {
-          "expr": "miwifi_uptime{host=~\"$host\"}",
+          "expr": "miwifi_uptime",
           "legendFormat": "{{host}}",
           "refId": "A"
         }
@@ -783,9 +789,64 @@
       }
     },
     {
+      "type": "timeseries",
+      "title": "exporter 自身：堆内存与 goroutine",
+      "id": 15,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 20
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "miwifi_exporter_heap_inuse_bytes",
+          "legendFormat": "堆内占用",
+          "refId": "A"
+        },
+        {
+          "expr": "miwifi_exporter_memory_sys_bytes",
+          "legendFormat": "向系统申请",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
       "type": "table",
       "title": "端点状态（1=成功）",
-      "id": 40,
+      "id": 16,
       "gridPos": {
         "h": 10,
         "w": 12,
@@ -798,7 +859,7 @@
       },
       "targets": [
         {
-          "expr": "miwifi_exporter_endpoint_up{host=~\"$host\"}",
+          "expr": "miwifi_exporter_endpoint_up",
           "legendFormat": "",
           "refId": "A",
           "format": "table",
@@ -835,7 +896,7 @@
     {
       "type": "table",
       "title": "已被停采的端点（reason 说明原因）",
-      "id": 41,
+      "id": 17,
       "gridPos": {
         "h": 10,
         "w": 12,
@@ -848,7 +909,7 @@
       },
       "targets": [
         {
-          "expr": "miwifi_exporter_endpoint_disabled{host=~\"$host\"} == 1",
+          "expr": "miwifi_exporter_endpoint_disabled == 1",
           "legendFormat": "",
           "refId": "A",
           "format": "table",
@@ -884,7 +945,7 @@
     }
   ],
   "refresh": "30s",
-  "schemaVersion": 39,
+  "schemaVersion": 38,
   "tags": [
     "miwifi",
     "exporter",
@@ -906,25 +967,15 @@
         "skipUrlSync": false
       },
       {
-        "name": "host",
-        "label": "路由器",
-        "type": "query",
         "datasource": {
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "query": "label_values(miwifi_exporter_router_up, host)",
-        "current": {
-          "selected": true,
-          "text": "All",
-          "value": "$__all"
-        },
-        "includeAll": true,
-        "multi": true,
-        "options": [],
-        "refresh": 2,
-        "regex": "",
-        "skipUrlSync": false
+        "filters": [],
+        "hide": 0,
+        "name": "Filters",
+        "skipUrlSync": false,
+        "type": "adhoc"
       }
     ]
   },

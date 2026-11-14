@@ -72,6 +72,9 @@ type Set struct {
 
 	reqCtx atomic.Pointer[setRequestCtx]
 
+	// rt 是 exporter 自身的运行时指标（goroutine 数、堆占用）。
+	rt *runtimeMetrics
+
 	// schemaMu / schemaFingerprint 记住上一次记录的端点集合差异，
 	// 用于「差异变化时才记录」的判断。
 	schemaMu          sync.Mutex
@@ -108,6 +111,7 @@ func NewSet(specs []RouterSpec, opts SetOptions) (*Set, error) {
 	set := &Set{
 		logger: logger,
 		descs:  sharedDescs,
+		rt:     newRuntimeMetrics(opts.Namespace),
 		build:  newBuildInfo(opts.Namespace, opts.Version),
 	}
 
@@ -194,6 +198,12 @@ func (s *Set) Instances() []*Instance { return s.instances }
 func (s *Set) Register(reg *prometheus.Registry) error {
 	if err := reg.Register(s); err != nil {
 		return oerr.Wrap(err, "注册指标失败")
+	}
+	// exporter 自身的运行时指标与业务指标一并注册：
+	// 它们只有三条序列，但让「内存是不是在涨、goroutine 是不是在堆积」
+	// 这两个问题不必 ssh 上机器就能回答。
+	if err := s.rt.Register(reg); err != nil {
+		return oerr.Wrap(err, "注册运行时指标失败")
 	}
 	return nil
 }
