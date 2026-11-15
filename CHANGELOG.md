@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### 新增：家庭网络总览 dashboard
+
+`deploy/grafana/home-network-dashboard.json`（17 个面板）把 **iKuai（出口路由）**
+与 **MiWiFi（内网路由）** 两套 exporter 的指标放到同一屏——它们是同一张网的
+两个视角，分开看不如一屏。导出侧用 `ikuai_*`，内网侧用 `miwifi_*`，
+并把两侧的 CPU/内存、在线设备数、exporter 自身内存放在一起对照。
+
+所有面板引用的指标名与 label 名都对着线上真实 `/metrics` 校验过。
+
+---
+
 > **1.19.5 是当前最新版本**。它补上 exporter 自身的运行时指标，并把 dashboard
 > 与仓库里已有的 ikuai 那套对齐成同一风格。1.19.3/1.19.4 补的**可观测性**
 > （端点停采状态、故障日志降噪、运行期差异巡检）、1.19.2 修的「静默假零」

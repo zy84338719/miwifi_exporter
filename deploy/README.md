@@ -5,7 +5,11 @@
 | 文件 | 作用 | 怎么用 |
 |---|---|---|
 | `prometheus/miwifi-alerts.yaml` | Prometheus 告警规则（7 条） | 见下 |
-| `grafana/miwifi-dashboard.json` | Grafana dashboard（16 个面板） | Grafana → Dashboards → Import → Upload JSON |
+| `grafana/miwifi-dashboard.json` | Grafana dashboard（17 个面板） | Grafana → Dashboards → Import → Upload JSON |
+| `grafana/home-network-dashboard.json` | **家庭网络总览**（17 个面板，跨两套 exporter） | 同上 |
+
+> 告警规则与 dashboard 里的每个指标名、每个 label 名，都对着线上真实
+> `/metrics` 输出校验过（46 条查询 + 16 条规则，全部命中真实存在的指标）。
 
 ## Prometheus 告警规则
 
@@ -82,6 +86,23 @@ PY
 ```
 
 导入后到 dashboard 设置里选 Prometheus 数据源（`DS_PROMETHEUS` 变量）。
+
+## 家庭网络总览 dashboard
+
+`grafana/home-network-dashboard.json` 把 **iKuai（出口路由）** 与
+**MiWiFi（内网路由）** 两套 exporter 的指标放到同一屏——它们是同一张网的
+两个视角，分开看不如一屏：
+
+- 出口侧：`ikuai_up` / `ikuai_interface_*_speed_bytes` / `ikuai_devices_online_total`
+- 内网侧：`miwifi_exporter_router_up` / `miwifi_wan_*_speed` / `miwifi_device_*`
+- 出口侧 CPU/内存 vs 内网侧 CPU/内存
+- exporter 自身内存（两套对照）
+
+它依赖两套 exporter 同时被 Prometheus 抓取。导入后如果某个面板空着，
+先确认对应的 exporter job 在不在。
+
+> iKuai 侧的**告警规则**不在本仓库，而在
+> `ikuai_exporter` 仓库的 `deploy/prometheus/ikuai-alerts.yaml`。
 
 ## 排查入口
 
